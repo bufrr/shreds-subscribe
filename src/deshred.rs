@@ -1,21 +1,25 @@
-use solana_ledger::{
-    shred::{
-        merkle::{Shred, ShredCode},
-        ReedSolomonCache, ShredType, Shredder,
-    },
-};
-use solana_sdk::clock::{Slot};
-use std::collections::{HashSet};
-use std::hash::{Hash};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::broadcast;
+use crate::rpc::Subscription;
+use dashmap::DashMap;
 use itertools::Itertools;
-use tracing::{debug, info, warn};
-use std::time::{Duration};
-use std::thread;
 use solana_ledger::blockstore::MAX_DATA_SHREDS_PER_SLOT;
+use solana_ledger::shred::{
+    ReedSolomonCache, ShredType, Shredder,
+    merkle::{Shred, ShredCode},
+};
+use solana_sdk::clock::Slot;
 use solana_streamer::packet::PacketBatch;
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::hash::Hash;
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
+use tracing::{debug, info, trace, warn};
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 enum ShredStatus {
@@ -50,35 +54,51 @@ impl Default for SlotStateTracker {
     }
 }
 
-pub async fn reconstruct_shreds_server(mut shutdown_rx: broadcast::Receiver<()>, reconstruct_tx: crossbeam_channel::Receiver<PacketBatch>, subscribe_account: String,
-)-> anyhow::Result<()> {
-    let exit=  Arc::new(AtomicBool::new(false));
+pub async fn reconstruct_shreds_server(
+    mut shutdown_rx: broadcast::Receiver<()>,
+    reconstruct_tx: crossbeam_channel::Receiver<PacketBatch>,
+    subscriptions: Arc<DashMap<String, Subscription>>,
+    trace_log_path: Option<String>,
+) -> anyhow::Result<()> {
+    let exit = Arc::new(AtomicBool::new(false));
+
+    // Setup log file if provided
+    let trace_log_file = if let Some(ref path) = trace_log_path {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Some(Arc::new(Mutex::new(file)))
+    } else {
+        None
+    };
 
     let handle = thread::spawn({
         let exit_clone = Arc::clone(&exit);
         move || {
-        let mut all_slots = ahash::HashMap::<Slot, (ahash::HashMap<u32, HashSet<ComparableShred>>, SlotStateTracker)>::default();
-        let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
-        let mut highest_slot_seen: Slot = 0;
-        let rs_cache = ReedSolomonCache::default();
+            let mut all_slots = ahash::HashMap::<
+                Slot,
+                (
+                    ahash::HashMap<u32, HashSet<ComparableShred>>,
+                    SlotStateTracker,
+                ),
+            >::default();
+            let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
+            let mut highest_slot_seen: Slot = 0;
+            let rs_cache = ReedSolomonCache::default();
 
-        while !exit_clone.load(Ordering::Relaxed) {
-            match reconstruct_tx.recv_timeout(Duration::from_millis(100)) {
-                Ok(packet_batch) => {
+            while !exit_clone.load(Ordering::Relaxed) {
+                if let Ok(packet_batch) = reconstruct_tx.recv_timeout(Duration::from_millis(100)) {
                     reconstruct_shreds(
                         packet_batch,
                         &mut all_slots,
                         &mut slot_fec_indexes_to_iterate,
                         &mut highest_slot_seen,
                         &rs_cache,
-                        &subscribe_account,
+                        &subscriptions,
+                        &trace_log_file,
                     );
-                }
-                Err(_) => {
                 }
             }
         }
-    }});
+    });
 
     shutdown_rx.recv().await?;
     exit.store(true, Ordering::Relaxed);
@@ -89,34 +109,50 @@ pub async fn reconstruct_shreds_server(mut shutdown_rx: broadcast::Receiver<()>,
 const SLOT_LOOKBACK: Slot = 10;
 pub fn reconstruct_shreds(
     packet_batch: PacketBatch,
-    all_slots: &mut ahash::HashMap<Slot, (ahash::HashMap<u32 /* fec_set_index */, HashSet<ComparableShred>>, SlotStateTracker)>,
+    all_slots: &mut ahash::HashMap<
+        Slot,
+        (
+            ahash::HashMap<u32 /* fec_set_index */, HashSet<ComparableShred>>,
+            SlotStateTracker,
+        ),
+    >,
     slot_fec_indexes_set: &mut Vec<(Slot, u32)>,
     highest_slot_seen: &mut Slot,
     rs_cache: &ReedSolomonCache,
-    subscribe_account: &str,
+    subscriptions: &Arc<DashMap<String, Subscription>>,
+    trace_log_file: &Option<Arc<Mutex<std::fs::File>>>,
 ) -> usize {
     slot_fec_indexes_set.clear();
     // ingest all packets
     for packet in packet_batch.iter().filter_map(|p| p.data(..)) {
-        match solana_ledger::shred::Shred::new_from_serialized_shred(packet.to_vec()).and_then(Shred::try_from) {
+        match solana_ledger::shred::Shred::new_from_serialized_shred(packet.to_vec())
+            .and_then(Shred::try_from)
+        {
             Ok(shred) => {
                 let slot = shred.common_header().slot;
                 let index = shred.index() as usize;
                 let fec_set_index = shred.fec_set_index();
                 let (slot_map, state_tracker) = all_slots.entry(slot).or_default();
                 if highest_slot_seen.saturating_sub(SLOT_LOOKBACK) > slot {
-                    debug!("Old shred slot: {slot}, fec_set_index: {fec_set_index}, index: {index}");
+                    debug!(
+                        "Old shred slot: {slot}, fec_set_index: {fec_set_index}, index: {index}"
+                    );
                     continue;
                 }
-                if state_tracker.already_recovered_fec_sets[fec_set_index as usize] || state_tracker.already_deshredded[index] {
-                    debug!("Already completed slot: {slot}, fec_set_index: {fec_set_index}, index: {index}");
+                if state_tracker.already_recovered_fec_sets[fec_set_index as usize]
+                    || state_tracker.already_deshredded[index]
+                {
+                    debug!(
+                        "Already completed slot: {slot}, fec_set_index: {fec_set_index}, index: {index}"
+                    );
                     continue;
                 }
                 let Some(_shred_index) = update_state_tracker(&shred, state_tracker) else {
                     continue;
                 };
 
-                slot_map.entry(fec_set_index)
+                slot_map
+                    .entry(fec_set_index)
                     .or_default()
                     .insert(ComparableShred(shred));
 
@@ -137,11 +173,19 @@ pub fn reconstruct_shreds(
     for (slot, fec_set_index) in slot_fec_indexes_set.iter() {
         let (slot_map, state_tracker) = all_slots.entry(*slot).or_default();
         let fec_shreds = slot_map.entry(*fec_set_index).or_default();
-        let (num_expected_data_shreds, num_expected_coding_shreds, num_data_shreds, num_coding_shreds) = get_data_shred_info(fec_shreds);
+        let (
+            num_expected_data_shreds,
+            num_expected_coding_shreds,
+            num_data_shreds,
+            num_coding_shreds,
+        ) = get_data_shred_info(fec_shreds);
 
         // haven't received last data shred, haven't seen any coding shreds, so wait until more arrive
         let min_shreds_needed_to_recover = num_expected_data_shreds as usize;
-        if num_expected_data_shreds == 0 || fec_shreds.len() < min_shreds_needed_to_recover || num_data_shreds == num_expected_data_shreds {
+        if num_expected_data_shreds == 0
+            || fec_shreds.len() < min_shreds_needed_to_recover
+            || num_data_shreds == num_expected_data_shreds
+        {
             continue;
         }
 
@@ -154,7 +198,9 @@ pub fn reconstruct_shreds(
         let recovered = match solana_ledger::shred::merkle::recover(merkle_shreds, rs_cache) {
             Ok(r) => r, // data shreds followed by code shreds (whatever was missing from to_deshred_payload)
             Err(e) => {
-                warn!("Failed to recover shreds for slot {slot} fec_set_index {fec_set_index}. num_expected_data_shreds: {num_expected_data_shreds}, num_data_shreds: {num_data_shreds} num_expected_coding_shreds: {num_expected_coding_shreds} num_coding_shreds: {num_coding_shreds} Err: {e}",);
+                warn!(
+                    "Failed to recover shreds for slot {slot} fec_set_index {fec_set_index}. num_expected_data_shreds: {num_expected_data_shreds}, num_data_shreds: {num_data_shreds} num_expected_coding_shreds: {num_expected_coding_shreds} num_coding_shreds: {num_coding_shreds} Err: {e}",
+                );
                 continue;
             }
         };
@@ -177,7 +223,9 @@ pub fn reconstruct_shreds(
         }
 
         if fec_set_recovered_count > 0 {
-            debug!("recovered slot: {slot}, fec_index: {fec_set_index}, recovered count: {fec_set_recovered_count}");
+            debug!(
+                "recovered slot: {slot}, fec_index: {fec_set_index}, recovered count: {fec_set_recovered_count}"
+            );
             state_tracker.already_recovered_fec_sets[*fec_set_index as usize] = true;
             fec_shreds.clear();
         }
@@ -192,33 +240,93 @@ pub fn reconstruct_shreds(
             continue;
         };
 
-        let to_deshred = &slot_state_tracker.data_shreds[start_data_complete_idx..=end_data_complete_idx];
-        let deshredded_payload = match Shredder::deshred(to_deshred.iter().map(|s| s.as_ref().unwrap().payload()) ) {
+        let to_deshred =
+            &slot_state_tracker.data_shreds[start_data_complete_idx..=end_data_complete_idx];
+        let deshredded_payload = match Shredder::deshred(
+            to_deshred.iter().map(|s| s.as_ref().unwrap().payload()),
+        ) {
             Ok(v) => v,
             Err(e) => {
-                warn!("slot {slot} failed to deshred slot: {slot}, start_data_complete_idx: {start_data_complete_idx}, end_data_complete_idx: {end_data_complete_idx}. Err: {e}");
+                warn!(
+                    "slot {slot} failed to deshred slot: {slot}, start_data_complete_idx: {start_data_complete_idx}, end_data_complete_idx: {end_data_complete_idx}. Err: {e}"
+                );
                 continue;
             }
         };
 
-        let entries = match bincode::deserialize::<Vec<solana_entry::entry::Entry>>(&deshredded_payload) {
-            Ok(entries) => {
-                entries
-            },
-            Err(_) => {
+        let entries = match bincode::deserialize::<Vec<solana_entry::entry::Entry>>(
+            &deshredded_payload,
+        ) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    "slot {slot} failed to deserialize entries. start_idx: {start_data_complete_idx}, end_idx: {end_data_complete_idx}. Err: {e}"
+                );
                 continue;
             }
         };
+        // Capture timestamp when we first receive transactions from shreds
+        let shred_received_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         for entry in &entries {
             for tx in &entry.transactions {
-                if tx.message.static_account_keys().iter().any(|k| *k == subscribe_account.parse().unwrap()) {
-                    info!("Found target account in slot {}: {:?}",slot,tx.signatures[0].to_string());
+                let tx_sig = if !tx.signatures.is_empty() {
+                    tx.signatures[0].to_string()
+                } else {
+                    continue;
+                };
+
+                // Check if anyone is waiting for this transaction
+                if let Some((_, subscription)) = subscriptions.remove(&tx_sig) {
+                    // Compute latency metrics using shred received timestamp
+                    let total_latency_ms =
+                        shred_received_at_ms.saturating_sub(subscription.client_timestamp_ms);
+                    let rpc_latency_ms = subscription
+                        .rpc_received_ms
+                        .saturating_sub(subscription.client_timestamp_ms);
+                    let after_rpc_latency_ms =
+                        shred_received_at_ms.saturating_sub(subscription.rpc_received_ms);
+
+                    info!(
+                        "Found transaction {} in slot {} (total: {}ms, rpc: {}ms, after_rpc: {}ms, client: {}ms, rpc_recv: {}ms, found: {}ms)",
+                        tx_sig,
+                        *slot,
+                        total_latency_ms,
+                        rpc_latency_ms,
+                        after_rpc_latency_ms,
+                        subscription.client_timestamp_ms,
+                        subscription.rpc_received_ms,
+                        shred_received_at_ms
+                    );
+
+                    // Write structured log to file if provided (use shred received timestamp)
+                    if let Some(log_file) = trace_log_file {
+                        let log_entry =
+                            format!("SOL,{},,,,,,,,,,{},,,\n", tx_sig, shred_received_at_ms);
+
+                        if let Ok(mut file) = log_file.lock() {
+                            if let Err(e) = file.write_all(log_entry.as_bytes()) {
+                                warn!("Failed to write to trace log file: {}", e);
+                            } else if let Err(e) = file.flush() {
+                                warn!("Failed to flush trace log file: {}", e);
+                            }
+                        }
+                    }
+
+                    // Also use trace logging for the structured format (use shred received timestamp)
+                    trace!("SOL,{},,,,,,,,,,{},,,", tx_sig, shred_received_at_ms);
                 }
             }
         }
 
-        let txn_count : u64 = entries.iter().map(|e| e.transactions.len() as u64).sum();
-        debug!("Successfully decoded slot: {slot} start_data_complete_idx: {start_data_complete_idx} end_data_complete_idx: {end_data_complete_idx} with entry count: {}, txn count: {txn_count}",entries.len(),);
+        let txn_count: u64 = entries.iter().map(|e| e.transactions.len() as u64).sum();
+        debug!(
+            "Successfully decoded slot: {slot} start_data_complete_idx: {start_data_complete_idx} end_data_complete_idx: {end_data_complete_idx} with entry count: {}, txn count: {txn_count}",
+            entries.len(),
+        );
 
         to_deshred.iter().for_each(|shred| {
             let Some(shred) = shred.as_ref() else {
@@ -249,10 +357,18 @@ pub fn reconstruct_shreds(
                 incomplete_fec_sets
                     .entry(*slot)
                     .and_modify(|fec_set_data| {
-                        fec_set_data.push((*fec_set_index, num_expected_data_shreds, fec_set_shreds.len()))
+                        fec_set_data.push((
+                            *fec_set_index,
+                            num_expected_data_shreds,
+                            fec_set_shreds.len(),
+                        ))
                     })
                     .or_insert_with(|| {
-                        vec![(*fec_set_index, num_expected_data_shreds, fec_set_shreds.len())]
+                        vec![(
+                            *fec_set_index,
+                            num_expected_data_shreds,
+                            fec_set_shreds.len(),
+                        )]
                     });
             }
 
@@ -264,7 +380,12 @@ pub fn reconstruct_shreds(
                 .for_each(|(_slot, fec_set_indexes)| fec_set_indexes.sort_unstable());
 
             for (slot, fec_infos) in &incomplete_fec_sets {
-                info!("Slot {} has {} incomplete FEC sets: {:?}",slot,fec_infos.len(),fec_infos);
+                info!(
+                    "Slot {} has {} incomplete FEC sets: {:?}",
+                    slot,
+                    fec_infos.len(),
+                    fec_infos
+                );
             }
         }
     }
@@ -315,7 +436,7 @@ fn update_state_tracker(shred: &Shred, state_tracker: &mut SlotStateTracker) -> 
     }
     if shred.shred_type() == ShredType::Data
         && (state_tracker.data_shreds[index].is_some()
-        || !matches!(state_tracker.data_status[index], ShredStatus::Unknown))
+            || !matches!(state_tracker.data_status[index], ShredStatus::Unknown))
     {
         return None;
     }
@@ -434,10 +555,10 @@ impl PartialEq for ComparableShred {
                                 usize::from(proof_size)
                                     * solana_ledger::shred::merkle::SIZE_OF_MERKLE_PROOF_ENTRY
                                     + if resigned {
-                                    solana_ledger::shred::SIZE_OF_SIGNATURE
-                                } else {
-                                    0
-                                },
+                                        solana_ledger::shred::SIZE_OF_SIGNATURE
+                                    } else {
+                                        0
+                                    },
                             );
 
                     s1.coding_header == s2.coding_header

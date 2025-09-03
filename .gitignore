@@ -4,3 +4,6 @@ nohup.out
 *.log
 *.bin
 .vscode
+.mcp.json
+CLAUDE.md
+AGENTS.md

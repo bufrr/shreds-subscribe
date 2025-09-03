@@ -5,8 +5,8 @@ use std::net::UdpSocket as StdUdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-use tokio::sync::broadcast::{Receiver};
-use tracing::{info};
+use tokio::sync::broadcast::Receiver;
+use tracing::info;
 
 pub async fn run_udp_server(
     port: u16,
@@ -40,7 +40,7 @@ pub async fn run_udp_server(
                     packet_sender,
                     recycler,
                     Arc::new(StreamerReceiveStats::new("packet_modifier")),
-                    Duration::from_millis(1),
+                    Some(Duration::from_millis(1)),
                     true,
                     None,
                     false,
