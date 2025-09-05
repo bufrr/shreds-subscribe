@@ -17,7 +17,7 @@ This repo is intended to help measure the interval between “client submitted�
 - RPC HTTP: `28899` (default in code)
 
 Notes:
-- Docs and scripts use `28899` by default; adjust `rpc_port` in `src/main.rs` if you prefer a different port.
+- Docs and scripts use `28899` by default; change ports via CLI flags or environment variables.
 
 ## Requirements
 
@@ -51,7 +51,7 @@ You should see logs indicating the UDP listener and RPC server ports.
 http://localhost:28899
 ```
 
-Change the port if you modify `rpc_port` in `src/main.rs`.
+Change the port via CLI flags or environment variables.
 
 ### JSON‑RPC Version
 
@@ -132,7 +132,7 @@ import requests, time
 
 def subscribe_to_transaction(tx_hash, rpc_url='http://localhost:28899'):
     ts = int(time.time() * 1000)
-    payload = {"jsonrpc":"2.0","method":"subscribe_tx","params":[tx_hash, ts],"id":1}
+    payload = {"jsonrpc":"2.0","method":"subscribe_tx","params":{"tx_sig": tx_hash, "timestamp": ts},"id":1}
     r = requests.post(rpc_url, json=payload)
     j = r.json()
     if 'error' in j: raise Exception(j['error']['message'])
@@ -175,3 +175,37 @@ Interpretation:
 
 - Ensure `Cargo.toml`’s `solana-ledger` path points to your local `jito-solana/ledger` checkout.
 - UDP shreds come from your Solana node; configure your network to forward or mirror them to this host and port (`18999` by default).
+
+## CLI Flags and Environment
+
+The binary reads configuration from flags or environment variables:
+
+- `--udp-port` or `UDP_PORT` (default `18999`)
+- `--rpc-port` or `RPC_PORT` (default `28899`)
+- `--trace-log-path` or `TRACE_LOG_PATH` (optional file path)
+
+Examples:
+
+```bash
+shreds-subscribe --udp-port 18999 --rpc-port 28899 --trace-log-path server.log
+# or via env vars
+UDP_PORT=18999 RPC_PORT=28899 TRACE_LOG_PATH=server.log shreds-subscribe
+```
+
+## Docker
+
+This project references a local `solana-ledger` path in `Cargo.toml`. Docker builds run in a clean container, so you must make that path available inside the build context or switch to a git dependency. Options:
+
+- Vendor the ledger into the repo and use a relative path:
+  - Place your checkout at `vendor/jito-solana/ledger`.
+  - Update `Cargo.toml` to `solana-ledger = { path = "vendor/jito-solana/ledger" }`.
+  - Ensure `vendor/` is included in the Docker build context and copied in the Dockerfile.
+- Or switch to a pinned git dependency specifically for Docker builds.
+
+Using docker-compose (provided):
+
+```bash
+docker compose up --build
+```
+
+Compose publishes UDP `18999` and HTTP `28899`, mounts `./logs` at `/app/logs`, and passes `--trace-log-path /app/logs/trace.log`. You can alternatively configure ports via env vars since the binary reads `UDP_PORT`/`RPC_PORT`.

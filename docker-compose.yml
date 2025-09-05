@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  shreds-subscribe:
+    build: .
+    container_name: shreds-subscribe
+    ports:
+      - "${UDP_PORT}:${UDP_PORT}/udp"  # UDP port for shred stream
+      - "${RPC_PORT}:${RPC_PORT}"       # RPC port
+    environment:
+      - UDP_PORT=${UDP_PORT}
+      - RPC_PORT=${RPC_PORT}
+      - TRACE_LOG_PATH=${TRACE_LOG_PATH}
+      - RUST_LOG=${RUST_LOG}
+    volumes:
+      - ./logs:/app/logs    # Mount logs directory for trace logs
+    restart: unless-stopped
+    networks:
+      - solana-network
+    env_file:
+      - .env
+
+networks:
+  solana-network:
+    driver: bridge

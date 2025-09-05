@@ -14,17 +14,23 @@ use tracing::{error, info};
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long, help = "Path to the trace log file")]
+    #[arg(long, env = "TRACE_LOG_PATH", help = "Path to the trace log file")]
     trace_log_path: Option<String>,
 
     #[arg(
         long,
+        env = "UDP_PORT",
         default_value = "18999",
         help = "UDP port for receiving shred stream"
     )]
     udp_port: u16,
 
-    #[arg(long, default_value = "28899", help = "Port for RPC server")]
+    #[arg(
+        long,
+        env = "RPC_PORT",
+        default_value = "28899",
+        help = "Port for RPC server"
+    )]
     rpc_port: u16,
 }
 
