@@ -21,6 +21,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tracing::{debug, info, trace, warn};
 
+// Fixed identifiers for structured trace logs
+const CHAIN_ID: u32 = 501;
+const PROCESS: u32 = 10010;
+const PROCESS_WORD: &str = "node_e2e_shreds_parse";
+
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 enum ShredStatus {
     #[default]
@@ -304,8 +309,12 @@ pub fn reconstruct_shreds(
 
                     // Write structured log to file if provided (use shred received timestamp)
                     if let Some(log_file) = trace_log_file {
-                        let log_entry =
-                            format!("SOL,{},,,,,,,,,,{},,,\n", tx_sig, shred_received_at_ms);
+                        // Format: chain,hash,status,serviceName,business,client,chainId,process,processWord,index,innerIndex,currentTime,referId,contractAddress,blockHeight
+                        // Provided: chain=SOL, hash=tx_sig, chainId=CHAIN_ID, process=PROCESS, processWord=PROCESS_WORD, currentTime=shred_received_at_ms; others empty
+                        let log_entry = format!(
+                            "SOL,{},,,,{},{},{},,{},,,\n",
+                            tx_sig, CHAIN_ID, PROCESS, PROCESS_WORD, shred_received_at_ms
+                        );
 
                         if let Ok(mut file) = log_file.lock() {
                             if let Err(e) = file.write_all(log_entry.as_bytes()) {
@@ -317,7 +326,10 @@ pub fn reconstruct_shreds(
                     }
 
                     // Also use trace logging for the structured format (use shred received timestamp)
-                    trace!("SOL,{},,,,,,,,,,{},,,", tx_sig, shred_received_at_ms);
+                    trace!(
+                        "SOL,{},,,,{},{},{},,{},,,",
+                        tx_sig, CHAIN_ID, PROCESS, PROCESS_WORD, shred_received_at_ms
+                    );
                 }
             }
         }
