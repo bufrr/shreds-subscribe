@@ -1,12 +1,12 @@
 use serde_json::json;
 use solana_client::rpc_client::RpcClient;
+use solana_commitment_config::CommitmentLevel;
+use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_sdk::hash::Hash;
-use solana_sdk::instruction::{AccountMeta, Instruction};
-use solana_sdk::message::Message;
 use solana_sdk::native_token::LAMPORTS_PER_SOL;
-use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
+use solana_system_transaction as system_transaction;
 use std::fs;
 use std::path::Path;
 use std::thread::sleep;
@@ -59,11 +59,12 @@ fn subscribe_tx(
     tx_sig: &str,
     ts_ms: u64,
 ) -> anyhow::Result<serde_json::Value> {
+    // Server expects a single positional parameter containing the named object
     let payload = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "subscribe_tx",
-        "params": { "tx_sig": tx_sig, "timestamp": ts_ms },
+        "params": [ { "tx_sig": tx_sig, "timestamp": ts_ms } ],
     });
     match ureq::post(subscribe_url).send_json(&payload) {
         Ok(mut resp) => {
@@ -99,21 +100,11 @@ fn e2e_send_self_and_subscribe() -> anyhow::Result<()> {
     println!("Using pubkey: {}", from);
 
     let lamports = (amount_sol * LAMPORTS_PER_SOL as f64) as u64;
-    // Create transfer instruction manually (self-transfer)
-    // System program ID: 11111111111111111111111111111111
-    let system_program_id = Pubkey::new_from_array([0u8; 32]);
-    let ix = Instruction::new_with_bincode(
-        system_program_id,
-        &(2u32, from, from, lamports), // SystemInstruction::Transfer
-        vec![AccountMeta::new(from, true), AccountMeta::new(from, false)],
-    );
-    let msg = Message::new(&[ix], Some(&from));
+    // Build a valid system transfer (self-transfer) transaction
 
     let client = RpcClient::new(rpc_url.clone());
     let bh: Hash = client.get_latest_blockhash()?;
-
-    let mut tx = Transaction::new_unsigned(msg);
-    tx.try_sign(&[&kp], bh)?;
+    let tx: Transaction = system_transaction::transfer(&kp, &from, lamports, bh);
     let tx_sig = tx.signatures[0].to_string();
     let ts_ms = now_ms();
     println!("Signature: {}", tx_sig);
@@ -126,7 +117,20 @@ fn e2e_send_self_and_subscribe() -> anyhow::Result<()> {
     println!("Subscribed at {} ms to {}", ts_ms, tx_sig);
 
     // 2) Send transaction to cluster
-    let sent_sig = client.send_transaction(&tx)?;
+    // Optionally allow skipping preflight via env (defaults to false)
+    let skip_preflight = std::env::var("SKIP_PREFLIGHT")
+        .ok()
+        .as_deref()
+        .map(|s| matches!(s, "1" | "true" | "TRUE"))
+        .unwrap_or(false);
+    let sent_sig = client.send_transaction_with_config(
+        &tx,
+        RpcSendTransactionConfig {
+            skip_preflight,
+            preflight_commitment: Some(CommitmentLevel::Processed),
+            ..Default::default()
+        },
+    )?;
     println!("Submitted tx: {}", sent_sig);
 
     // 3) Optionally poll to see if the subscription was consumed

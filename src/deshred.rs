@@ -20,7 +20,6 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tracing::{debug, info, trace, warn};
-
 // Fixed identifiers for structured trace logs
 const CHAIN_ID: u32 = 501;
 const PROCESS: u32 = 10010;
@@ -139,10 +138,8 @@ pub fn reconstruct_shreds(
         if size == 0 {
             continue;
         }
-        match solana_ledger::shred::Shred::new_from_serialized_shred(
-            packet_data[..size].to_vec(),
-        )
-        .and_then(Shred::try_from)
+        match solana_ledger::shred::Shred::new_from_serialized_shred(packet_data[..size].to_vec())
+            .and_then(Shred::try_from)
         {
             Ok(shred) => {
                 let slot = shred.common_header().slot;
@@ -462,6 +459,7 @@ mod tests {
     use dashmap::DashMap;
     use jsonrpc_core::Params;
     use serde_json::{Value, json};
+
     use solana_sdk::{
         hash::Hash,
         instruction::Instruction,
@@ -513,12 +511,12 @@ mod tests {
             subscriptions: subscriptions.clone(),
         };
 
-        // Subscribe via RPC using named params { tx_sig, timestamp }
-        let params_obj: Value = json!({
+        // jsonrpc-derive unwraps array-of-one on the wire and passes a Map here
+        let params_map: Value = json!({
             "tx_sig": tx_sig_str,
             "timestamp": now_ms(),
         });
-        let params = match params_obj {
+        let params = match params_map {
             Value::Object(map) => Params::Map(map),
             _ => unreachable!(),
         };

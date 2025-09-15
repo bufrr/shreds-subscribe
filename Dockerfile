@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.80 AS builder
+FROM rust:1.86 AS builder
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -14,14 +14,21 @@ RUN apt-get update && apt-get install -y \
 # Create app directory
 WORKDIR /usr/src/app
 
-# Copy Cargo files
-COPY Cargo.toml Cargo.lock ./
+# Set build-time args to control how solana-ledger is sourced
+ARG LEDGER_GIT_URL=https://github.com/jito-foundation/jito-solana.git
+ARG LEDGER_GIT_REF=eric/v2.2-merkle-recovery
 
-# Copy source code
+# Copy project files
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-# Build the application
-RUN cargo build --release
+# For Docker builds, rewrite the local path dependency on solana-ledger to a pinned git ref
+# This change is only inside the build container and does not modify your local files.
+RUN sed -ri \
+    's#^\s*solana-ledger\s*=.*#solana-ledger = { git = "'"${LEDGER_GIT_URL}"'", branch = "'"${LEDGER_GIT_REF}"'", package = "solana-ledger" }#' \
+    Cargo.toml \
+ && echo "Using solana-ledger from ${LEDGER_GIT_URL}@${LEDGER_GIT_REF}" \
+ && cargo build --release
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -36,7 +43,7 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -u 1000 appuser
 
 # Copy the binary from builder
-COPY --from=builder /usr/src/app/target/release/shreds-subcribe /usr/local/bin/shreds-subscribe
+COPY --from=builder /usr/src/app/target/release/shreds-subscribe /usr/local/bin/shreds-subscribe
 
 # Change ownership
 RUN chown appuser:appuser /usr/local/bin/shreds-subscribe

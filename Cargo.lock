@@ -4968,7 +4968,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
-name = "shreds-subcribe"
+name = "shreds-subscribe"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
@@ -4985,11 +4985,14 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-client",
+ "solana-commitment-config 3.0.0",
  "solana-entry 3.0.2",
  "solana-ledger",
  "solana-program 3.0.0",
+ "solana-rpc-client-api",
  "solana-sdk 3.0.0",
  "solana-streamer",
+ "solana-system-transaction 3.0.0",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -8260,7 +8263,7 @@ dependencies = [
  "solana-shred-version 2.2.1",
  "solana-signature 2.2.1",
  "solana-signer 2.2.1",
- "solana-system-transaction",
+ "solana-system-transaction 2.2.1",
  "solana-time-utils 2.2.1",
  "solana-transaction 2.2.1",
  "solana-transaction-context 2.2.1",
@@ -9134,6 +9137,21 @@ dependencies = [
  "solana-signer 2.2.1",
  "solana-system-interface 1.0.0",
  "solana-transaction 2.2.1",
+]
+
+[[package]]
+name = "solana-system-transaction"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31b5699ec533621515e714f1533ee6b3b0e71c463301d919eb59b8c1e249d30"
+dependencies = [
+ "solana-hash 3.0.0",
+ "solana-keypair 3.0.1",
+ "solana-message 3.0.1",
+ "solana-pubkey 3.0.0",
+ "solana-signer 3.0.0",
+ "solana-system-interface 2.0.0",
+ "solana-transaction 3.0.1",
 ]
 
 [[package]]

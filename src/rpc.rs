@@ -41,12 +41,25 @@ struct SubscribeParamsByName {
 
 impl Rpc for RpcImpl {
     fn subscribe_tx(&self, params: Params) -> Result<SubscribeResponse> {
-        // Parse params as a named object only
-        let parsed: SubscribeParamsByName = params.parse().map_err(|_| Error {
-            code: ErrorCode::InvalidParams,
-            message: "Expected named params: {tx_sig, timestamp}".to_string(),
-            data: None,
-        })?;
+        // Over HTTP, jsonrpc-derive unwraps the outer single-element array and
+        // passes the inner object as Params::Map. This preserves the on-wire
+        // requirement for array params while giving us a Map here.
+        let parsed: SubscribeParamsByName = match params {
+            Params::Map(map) => {
+                serde_json::from_value(serde_json::Value::Object(map)).map_err(|_| Error {
+                    code: ErrorCode::InvalidParams,
+                    message: "Expected object with tx_sig and timestamp fields".to_string(),
+                    data: None,
+                })?
+            }
+            _ => {
+                return Err(Error {
+                    code: ErrorCode::InvalidParams,
+                    message: "Expected params array: [{tx_sig, timestamp}]".to_string(),
+                    data: None,
+                });
+            }
+        };
 
         let tx_sig = parsed.tx_sig;
         let timestamp_ms = parsed.timestamp;
@@ -128,3 +141,5 @@ pub async fn start_rpc_server(
     info!("RPC server started on {}", addr);
     Ok(server)
 }
+
+// (unit test removed per request)

@@ -86,15 +86,15 @@ async fn main() -> anyhow::Result<()> {
     info!("receive exit signal, begin exit...");
     let _ = shutdown_tx.send(());
 
-    // Close RPC server from a blocking context to avoid dropping a runtime
-    // inside Tokio's async context (jsonrpc spawns its own runtime internally).
-    let _ = tokio::task::spawn_blocking(move || {
+    // Close RPC server on a plain OS thread so that its internal
+    // runtime is dropped outside of our Tokio async context.
+    let rpc_close = std::thread::spawn(move || {
         rpc_server.close();
-    })
-    .await;
+    });
 
     udp_handle.await?;
     reconstruct_handle.await?;
+    let _ = rpc_close.join();
 
     info!("All tasks have shut down.");
     Ok(())

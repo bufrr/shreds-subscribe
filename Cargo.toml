@@ -1,5 +1,5 @@
 [package]
-name = "shreds-subcribe"
+name = "shreds-subscribe"
 version = "0.1.0"
 edition = "2024"
 
@@ -30,3 +30,6 @@ dotenvy = "0.15"
 solana-client = "3.0.0"
 ureq = { version = "3.1.2", features = ["json"] }
 anyhow = "1.0"
+solana-rpc-client-api = "3.0.0"
+solana-commitment-config = "3.0.0"
+solana-system-transaction = "3.0.0"
