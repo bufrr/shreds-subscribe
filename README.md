@@ -13,11 +13,11 @@ This repo is intended to help measure the interval between “client submitted�
 
 ## Ports
 
-- UDP shreds: `18999` (default in code)
-- RPC HTTP: `28899` (default in code)
+- UDP shreds: `18888` (default in code)
+- RPC HTTP: `12345` (default in code)
 
 Notes:
-- Docs and scripts use `28899` by default; change ports via CLI flags or environment variables.
+- Docs and scripts use `12345` by default; change ports via CLI flags or environment variables.
 
 ## Requirements
 
@@ -48,7 +48,7 @@ You should see logs indicating the UDP listener and RPC server ports.
 ### Base URL
 
 ```
-http://localhost:28899
+http://localhost:12345
 ```
 
 Change the port via CLI flags or environment variables.
@@ -94,7 +94,7 @@ curl:
 
 ```bash
 TIMESTAMP=$(date +%s%3N)
-curl -X POST http://localhost:28899 \
+curl -X POST http://localhost:12345 \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
@@ -107,7 +107,7 @@ curl -X POST http://localhost:28899 \
 JavaScript:
 
 ```javascript
-async function subscribeToTransaction(txHash, rpcUrl = 'http://localhost:28899') {
+async function subscribeToTransaction(txHash, rpcUrl = 'http://localhost:12345') {
   const timestamp = Date.now();
   const response = await fetch(rpcUrl, {
     method: 'POST',
@@ -130,7 +130,7 @@ Python:
 ```python
 import requests, time
 
-def subscribe_to_transaction(tx_hash, rpc_url='http://localhost:28899'):
+def subscribe_to_transaction(tx_hash, rpc_url='http://localhost:12345'):
     ts = int(time.time() * 1000)
     payload = {"jsonrpc":"2.0","method":"subscribe_tx","params":{"tx_sig": tx_hash, "timestamp": ts},"id":1}
     r = requests.post(rpc_url, json=payload)
@@ -158,7 +158,7 @@ Interpretation:
 
 ## Test & Dev
 
-- Smoke test script: `./test_rpc.sh` (uses port `28899`). Adjust the script or change `rpc_port` in `src/main.rs` to match.
+- Smoke test script: `./test_rpc.sh` (uses port `12345`). Adjust the script or change `rpc_port` in `src/main.rs` to match.
 - Build: `cargo build --release`
 - Run: `cargo run --release`
 - Format: `cargo fmt --all`
@@ -174,23 +174,44 @@ Interpretation:
 ## Notes
 
 - Ensure `Cargo.toml`’s `solana-ledger` path points to your local `jito-solana/ledger` checkout.
-- UDP shreds come from your Solana node; configure your network to forward or mirror them to this host and port (`18999` by default).
+- UDP shreds come from your Solana node; configure your network to forward or mirror them to this host and port (`18888` by default).
 
 ## CLI Flags and Environment
 
 The binary reads configuration from flags or environment variables:
 
-- `--udp-port` or `UDP_PORT` (default `18999`)
-- `--rpc-port` or `RPC_PORT` (default `28899`)
+- `--udp-port` or `UDP_PORT` (default `18888`)
+- `--rpc-port` or `RPC_PORT` (default `12345`)
 - `--trace-log-path` or `TRACE_LOG_PATH` (optional file path)
+- `--config` or `CONFIG_PATH` (path to a `config.toml` file)
 
 Examples:
 
 ```bash
-shreds-subscribe --udp-port 18999 --rpc-port 28899 --trace-log-path server.log
-# or via env vars
-UDP_PORT=18999 RPC_PORT=28899 TRACE_LOG_PATH=server.log shreds-subscribe
+# Highest priority: CLI flags
+shreds-subscribe --udp-port 18888 --rpc-port 12345 --trace-log-path server.log
+
+# Or via exported env vars (not .env)
+export UDP_PORT=18888 RPC_PORT=12345 TRACE_LOG_PATH=server.log
+shreds-subscribe
+
+# Or via config file (TOML). Precedence: CLI/env > config file > defaults
+cp config.example.toml config.toml
+sed -i 's/^# udp_port.*/udp_port = 18888/' config.toml
+sed -i 's/^# rpc_port.*/rpc_port = 12345/' config.toml
+shreds-subscribe --config config.toml
 ```
+
+### Configuration File (TOML)
+
+You can provide a `config.toml` (auto-detected in CWD) or pass `--config /path/to/config.toml`.
+
+Keys:
+- `udp_port` (u16)
+- `rpc_port` (u16)
+- `trace_log_path` (string)
+
+Example: see `config.example.toml`.
 
 ## Docker
 
@@ -208,4 +229,32 @@ Using docker-compose (provided):
 docker compose up --build
 ```
 
-Compose publishes UDP `18999` and HTTP `28899`, mounts `./logs` at `/app/logs`, and passes `--trace-log-path /app/logs/trace.log`. You can alternatively configure ports via env vars since the binary reads `UDP_PORT`/`RPC_PORT`.
+Compose publishes UDP `18888` and HTTP `12345`, mounts `./logs` at `/app/logs`. Override ports with exported env vars before running compose, e.g. `export UDP_PORT=20000 RPC_PORT=30000`.
+
+Note: `.env` is reserved for e2e test secrets only and is not consumed by the runtime binary or compose by default.
+
+## E2E Test .env
+
+The e2e test `tests/e2e_send_self.rs` loads `.env` for sensitive values only.
+
+Put only secrets in `.env`:
+
+```
+PRIVKEY=/home/you/.config/solana/id.json
+```
+
+Other test vars have safe defaults and can be exported if needed:
+- `SOLANA_RPC_URL` defaults to `http://127.0.0.1:8899`
+- `SUBSCRIBE_URL` defaults to `http://127.0.0.1:12345`
+- `AMOUNT_SOL` defaults to `0.01`
+
+If you want to override those, export them in your shell (do not add to `.env`):
+
+```
+export SOLANA_RPC_URL=http://127.0.0.1:8899
+export SUBSCRIBE_URL=http://127.0.0.1:12345
+export AMOUNT_SOL=0.01
+export SKIP_PREFLIGHT=false
+```
+
+See `.env.example` for a template. It includes only `PRIVKEY` and commented examples of shell exports for the rest.

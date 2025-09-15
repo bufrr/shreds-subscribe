@@ -52,11 +52,11 @@ RUN chown appuser:appuser /usr/local/bin/shreds-subscribe
 USER appuser
 
 # Expose ports
-EXPOSE 18999/udp 28899/tcp
+EXPOSE 18888/udp 12345/tcp
 
 # Set default environment variables (can be overridden)
-ENV UDP_PORT=18999 \
-    RPC_PORT=28899 \
+ENV UDP_PORT=18888 \
+    RPC_PORT=12345 \
     TRACE_LOG_PATH=
 
 # Run the application; flags are optional since ports can be set via env

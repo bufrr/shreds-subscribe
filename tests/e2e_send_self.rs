@@ -89,7 +89,7 @@ fn e2e_send_self_and_subscribe() -> anyhow::Result<()> {
     let rpc_url =
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
     let subscribe_url =
-        std::env::var("SUBSCRIBE_URL").unwrap_or_else(|_| "http://127.0.0.1:28899".to_string());
+        std::env::var("SUBSCRIBE_URL").unwrap_or_else(|_| "http://127.0.0.1:12345".to_string());
     let amount_sol: f64 = std::env::var("AMOUNT_SOL")
         .ok()
         .and_then(|s| s.parse().ok())

@@ -1,0 +1,11 @@
+## Example configuration for shreds-subscribe
+
+# UDP port for receiving shred stream
+# udp_port = 18888
+
+# RPC HTTP port
+# rpc_port = 12345
+
+# Optional structured trace log path
+# trace_log_path = "./server.log"
+
