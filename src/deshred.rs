@@ -135,8 +135,12 @@ pub fn reconstruct_shreds(
         let Some(packet_data) = packet.data(..) else {
             continue;
         };
+        let size = packet.meta().size.min(packet_data.len());
+        if size == 0 {
+            continue;
+        }
         match solana_ledger::shred::Shred::new_from_serialized_shred(
-            packet_data[..packet.meta().size].to_vec(),
+            packet_data[..size].to_vec(),
         )
         .and_then(Shred::try_from)
         {
@@ -247,11 +251,19 @@ pub fn reconstruct_shreds(
     // deshred and bincode deserialize
     for (slot, fec_set_index) in slot_fec_indexes_set.iter() {
         let (_, slot_state_tracker) = all_slots.entry(*slot).or_default();
-        let Some((start_data_complete_idx, end_data_complete_idx, _unknown_start)) =
+        let Some((start_data_complete_idx, end_data_complete_idx, unknown_start)) =
             get_indexes(slot_state_tracker, *fec_set_index as usize)
         else {
             continue;
         };
+        // If the left boundary is unknown, we may be starting mid-entry; skip until we
+        // have a confirmed left boundary to avoid noisy decode failures.
+        if unknown_start {
+            debug!(
+                "Skipping deshred for slot {slot} fec_set_index {fec_set_index} due to unknown left boundary"
+            );
+            continue;
+        }
 
         let to_deshred =
             &slot_state_tracker.data_shreds[start_data_complete_idx..=end_data_complete_idx];
