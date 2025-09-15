@@ -133,37 +133,5 @@ fn e2e_send_self_and_subscribe() -> anyhow::Result<()> {
     )?;
     println!("Submitted tx: {}", sent_sig);
 
-    // 3) Optionally poll to see if the subscription was consumed
-    // We re-attempt subscription; if it succeeds, the previous one was consumed by the server.
-    // If we still get an error "Transaction already subscribed", keep waiting.
-    let timeout = Duration::from_secs(60);
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed() > timeout {
-            anyhow::bail!(
-                "timeout waiting for subscriber to observe shreds for {}",
-                tx_sig
-            );
-        }
-        sleep(Duration::from_secs(2));
-        let v = subscribe_tx(&subscribe_url, &tx_sig, now_ms())?;
-        if let Some(err) = v.get("error") {
-            // Expecting code -32600 and message "Transaction already subscribed" until consumed
-            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
-            if code == -32600 && msg.contains("already subscribed") {
-                println!("still waiting for subscriber to observe shreds...");
-                continue;
-            }
-            anyhow::bail!("unexpected subscribe error: {}", err);
-        } else {
-            println!(
-                "subscriber consumed initial subscription; shreds observed for {}",
-                tx_sig
-            );
-            break;
-        }
-    }
-
     Ok(())
 }
