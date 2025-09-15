@@ -129,9 +129,16 @@ pub fn reconstruct_shreds(
 ) -> usize {
     slot_fec_indexes_set.clear();
     // ingest all packets
-    for packet in packet_batch.iter().filter_map(|p| p.data(..)) {
-        match solana_ledger::shred::Shred::new_from_serialized_shred(packet.to_vec())
-            .and_then(Shred::try_from)
+    for packet in packet_batch.iter() {
+        // Use the exact packet payload length; Packet buffers are larger than the
+        // actual UDP payload and using the full buffer can corrupt parsing.
+        let Some(packet_data) = packet.data(..) else {
+            continue;
+        };
+        match solana_ledger::shred::Shred::new_from_serialized_shred(
+            packet_data[..packet.meta().size].to_vec(),
+        )
+        .and_then(Shred::try_from)
         {
             Ok(shred) => {
                 let slot = shred.common_header().slot;
@@ -195,9 +202,10 @@ pub fn reconstruct_shreds(
         }
 
         // try to recover if we have enough shreds in the FEC set
+        // Sort with data shreds first, then coding shreds, and by index within type
         let merkle_shreds = fec_shreds
             .iter()
-            .sorted_by_key(|s| (u8::MAX - s.shred_type() as u8, s.index()))
+            .sorted_by_key(|s| (s.shred_type() as u8, s.index()))
             .map(|s| s.0.clone())
             .collect_vec();
         let recovered = match solana_ledger::shred::merkle::recover(merkle_shreds, rs_cache) {
@@ -403,6 +411,114 @@ pub fn reconstruct_shreds(
     }
 
     total_recovered_count
+}
+
+/// Test-only helper: scan a slice of entries for subscribed transactions
+/// and remove matched subscriptions. Returns the list of matched signatures.
+/// This bypasses UDP/shred decoding and is used by integration tests.
+#[cfg(test)]
+pub fn scan_entries_for_subscriptions_for_test(
+    entries: &[solana_entry::entry::Entry],
+    subscriptions: &DashMap<String, Subscription>,
+) -> Vec<String> {
+    let shred_received_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut matched = Vec::new();
+    for entry in entries {
+        for tx in &entry.transactions {
+            if tx.signatures.is_empty() {
+                continue;
+            }
+            let tx_sig = tx.signatures[0].to_string();
+            if let Some((_, subscription)) = subscriptions.remove(&tx_sig) {
+                let _total_latency_ms =
+                    shred_received_at_ms.saturating_sub(subscription.client_timestamp_ms);
+                matched.push(tx_sig);
+            }
+        }
+    }
+    matched
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_entries_for_subscriptions_for_test;
+    use crate::rpc::{Rpc, RpcImpl, Subscription};
+    use dashmap::DashMap;
+    use jsonrpc_core::Params;
+    use serde_json::{Value, json};
+    use solana_sdk::{
+        hash::Hash,
+        instruction::Instruction,
+        message::Message,
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    };
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn subscribe_and_detect_sol_transfer() {
+        // Construct a simple SOL transfer transaction
+        let from = Keypair::new();
+        let to = Keypair::new();
+        // Create a simple transfer instruction manually
+        // System program ID: 11111111111111111111111111111111
+        let system_program_id = Pubkey::new_from_array([0u8; 32]);
+        let ix = Instruction::new_with_bincode(
+            system_program_id,
+            &(2u32, from.pubkey(), to.pubkey(), 1u64), // SystemInstruction::Transfer
+            vec![
+                solana_sdk::instruction::AccountMeta::new(from.pubkey(), true),
+                solana_sdk::instruction::AccountMeta::new(to.pubkey(), false),
+            ],
+        );
+        let message = Message::new(&[ix], Some(&from.pubkey()));
+        let recent_blockhash = Hash::new_unique();
+        let mut tx = Transaction::new_unsigned(message);
+        tx.try_sign(&[&from], recent_blockhash).expect("sign");
+        let tx_sig_str = tx.signatures[0].to_string();
+
+        // Build a minimal entry containing the transaction
+        let prev_hash = Hash::new_unique();
+        let entry = solana_entry::entry::Entry::new(&prev_hash, 0, vec![tx.clone()]);
+        let entries = vec![entry];
+
+        // Create RPC with shared subscriptions map
+        let subscriptions = Arc::new(DashMap::<String, Subscription>::new());
+        let rpc = RpcImpl {
+            subscriptions: subscriptions.clone(),
+        };
+
+        // Subscribe via RPC using named params { tx_sig, timestamp }
+        let params_obj: Value = json!({
+            "tx_sig": tx_sig_str,
+            "timestamp": now_ms(),
+        });
+        let params = match params_obj {
+            Value::Object(map) => Params::Map(map),
+            _ => unreachable!(),
+        };
+        let resp = rpc.subscribe_tx(params).expect("rpc subscribe ok");
+        assert_eq!(resp.status, "subscribed");
+        assert!(subscriptions.contains_key(&tx_sig_str));
+
+        // Feed the entries into the scan helper to simulate detection
+        let matched = scan_entries_for_subscriptions_for_test(&entries, &subscriptions);
+        assert!(matched.contains(&tx_sig_str));
+        assert!(!subscriptions.contains_key(&tx_sig_str));
+    }
 }
 
 fn get_data_shred_info(

@@ -60,7 +60,12 @@ pub async fn run_udp_server(
                     return;
                 }
                 if let Ok(batch) = packet_receiver.recv_timeout(Duration::from_millis(100)) {
-                    let _ = reconstruct_tx.try_send(batch);
+                    if let Err(e) = reconstruct_tx.try_send(batch) {
+                        tracing::warn!(
+                            "Failed to send packet batch for reconstruction, channel may be full: {:?}",
+                            e
+                        );
+                    }
                 }
             }
         }
