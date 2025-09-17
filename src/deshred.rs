@@ -329,7 +329,7 @@ pub fn reconstruct_shreds(
                         // Format: chain,hash,status,serviceName,business,client,chainId,process,processWord,index,innerIndex,currentTime,referId,contractAddress,blockHeight
                         // Provided: chain=SOL, hash=tx_sig, chainId=CHAIN_ID, process=PROCESS, processWord=PROCESS_WORD, currentTime=shred_received_at_ms; others empty
                         let log_entry = format!(
-                            "SOL,{},,,,{},{},{},,{},,,\n",
+                            "SOL,{},,,,,{},{},{},,,{},,,\n",
                             tx_sig, CHAIN_ID, PROCESS, PROCESS_WORD, shred_received_at_ms
                         );
 
@@ -341,12 +341,6 @@ pub fn reconstruct_shreds(
                             }
                         }
                     }
-
-                    // Also use trace logging for the structured format (use shred received timestamp)
-                    trace!(
-                        "SOL,{},,,,{},{},{},,{},,,",
-                        tx_sig, CHAIN_ID, PROCESS, PROCESS_WORD, shred_received_at_ms
-                    );
                 }
             }
         }
