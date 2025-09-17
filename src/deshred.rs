@@ -22,7 +22,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, trace, warn};
 // Fixed identifiers for structured trace logs
 const CHAIN_ID: u32 = 501;
-const PROCESS: u32 = 10010;
+const PROCESS: u32 = 11011;
 const PROCESS_WORD: &str = "node_e2e_shreds_parse";
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
