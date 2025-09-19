@@ -10,6 +10,7 @@ solana-ledger = { git = "https://github.com/jito-foundation/jito-solana.git", br
 solana-streamer = "3.0.0"
 tracing-subscriber = { version = "0.3", features = ["fmt", "chrono", "env-filter"] }
 tracing = "0.1.41"
+tracing-appender = "0.2"
 ahash = "0.8.12"
 solana-sdk = "3.0.0"
 solana-entry = "3.0.0"

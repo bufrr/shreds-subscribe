@@ -11,6 +11,8 @@ This repo is intended to help measure the interval between “client submitted�
 - `src/deshred.rs`: Reconstructs/re‑covers FEC sets, deshreds entries, scans transactions, logs matches with latency.
 - `src/rpc.rs`: JSON‑RPC 2.0 method `subscribe_tx({ tx_sig, timestamp })`; validates and tracks subscriptions.
 
+For a deep dive into the UDP→entries decoding pipeline, see `docs/SHRED_PIPELINE.md`.
+
 ## Ports
 
 - UDP shreds: `18888` (default in code)
@@ -170,6 +172,22 @@ Interpretation:
 - Avoid exposing the RPC publicly; restrict access by firewall or security group.
 - Monitor CPU and network usage; shred streams can be high‑volume.
 - Consider log rotation if redirecting logs to a file.
+
+### Structured CSV Trace Log
+
+If `--trace-log-path` (or `trace_log_path` in config) is set, the service appends one CSV line per matched transaction. No CSV header is written.
+
+Columns (15, in order):
+`chain,hash,status,serviceName,business,client,chainId,process,processWord,index,innerIndex,currentTime,referId,contractAddress,blockHeight`
+
+Filled values in our build:
+- chain: `SOL`
+- hash: `<tx_sig>`
+- chainId: `501`
+- process: `10010`
+- processWord: `node_e2e_shreds_parse`
+- currentTime: `<ms_since_epoch_when_observed>`
+- All other columns: empty
 
 ## Notes
 

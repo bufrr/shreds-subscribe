@@ -1,11 +1,14 @@
-## Example configuration for shreds-subscribe
+# Example configuration file for shreds-subscribe
+# Copy this to config.toml and adjust as needed
 
 # UDP port for receiving shred stream
-# udp_port = 18888
+udp_port = 18888
 
-# RPC HTTP port
-# rpc_port = 12345
+# Port for RPC server
+rpc_port = 12345
 
-# Optional structured trace log path
-# trace_log_path = "./server.log"
+# Path to general application log file (optional)
+# log_path = "logs/app.log"
 
+# Path to trace log file for transaction tracking (optional)
+# trace_log_path = "logs/trace.log"

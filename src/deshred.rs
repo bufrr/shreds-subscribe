@@ -19,7 +19,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 // Fixed identifiers for structured trace logs
 const CHAIN_ID: u32 = 501;
 const PROCESS: u32 = 11011;
