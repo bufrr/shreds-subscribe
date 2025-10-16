@@ -46,20 +46,31 @@ struct Args {
     #[arg(long, default_value = "0.01", help = "Amount to transfer in SOL")]
     amount: f64,
 }
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
-fn format_timestamp(ms: u64) -> String {
-    let secs = ms / 1000;
-    let millis = ms % 1000;
-    let dt = chrono::DateTime::from_timestamp(secs as i64, (millis * 1_000_000) as u32)
+fn format_duration_ms(duration_ms: u64) -> String {
+    format!("{:.3} ms", duration_ms as f64)
+}
+
+fn format_human(ts_ms: u64) -> String {
+    let secs = (ts_ms / 1_000) as i64;
+    let sub_ms = (ts_ms % 1_000) as u32;
+    let dt = chrono::DateTime::from_timestamp(secs, sub_ms * 1_000_000)
         .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
     dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string()
+}
+
+fn format_hms_millis(ts_ms: u64) -> String {
+    let secs = (ts_ms / 1_000) as i64;
+    let sub_ms = (ts_ms % 1_000) as u32;
+    let dt = chrono::DateTime::from_timestamp(secs, sub_ms * 1_000_000)
+        .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
+    dt.format("%H:%M:%S%.3f").to_string()
 }
 
 async fn subscribe_local_ws(
@@ -114,7 +125,7 @@ async fn subscribe_local_ws(
 
 async fn subscribe_helius_ws(
     ws_url: &str,
-    signature: &str,
+    _signature: &str,
     wallet_pubkey: &str,
 ) -> Result<(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -234,7 +245,7 @@ async fn main() -> Result<()> {
     client
         .send_and_confirm_transaction(&tx)
         .context("Failed to send transaction")?;
-    println!("✓ Transaction sent at {}", format_timestamp(tx_sent_at));
+    println!("✓ Transaction sent at {}", format_human(tx_sent_at));
 
     // Wait for notifications from both sources
     println!("\n⏳ Waiting for notifications (max 60s)...\n");
@@ -244,18 +255,22 @@ async fn main() -> Result<()> {
 
     let local_notified_clone = local_notified_at.clone();
     let helius_notified_clone = helius_notified_at.clone();
+    let expected_sig_helius = signature.clone();
 
     let local_task = tokio::spawn(async move {
         while let Some(msg) = local_ws.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
+                    let received_ts = now_ms();
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if value.get("method").and_then(|m| m.as_str())
                             == Some("signatureNotification")
                         {
-                            let ts = now_ms();
-                            *local_notified_clone.lock().await = Some(ts);
-                            println!("✓ Local WS notification received");
+                            *local_notified_clone.lock().await = Some(received_ts);
+                            println!(
+                                "✓ Local WS notification received at {}",
+                                format_hms_millis(received_ts)
+                            );
                             break;
                         }
                     }
@@ -273,14 +288,31 @@ async fn main() -> Result<()> {
         while let Some(msg) = helius_ws.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
+                    let received_ts = now_ms();
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if value.get("method").and_then(|m| m.as_str())
                             == Some("transactionNotification")
                         {
-                            let ts = now_ms();
-                            *helius_notified_clone.lock().await = Some(ts);
-                            println!("✓ Helius WS notification received");
-                            break;
+                            // IMPORTANT: Verify this is OUR transaction, not just any transaction for this wallet
+                            let sig = value
+                                .get("params")
+                                .and_then(|p| p.get("result"))
+                                .and_then(|r| r.get("signature"))
+                                .and_then(|s| s.as_str());
+
+                            if sig == Some(expected_sig_helius.as_str()) {
+                                *helius_notified_clone.lock().await = Some(received_ts);
+                                println!(
+                                    "✓ Helius WS notification received at {}",
+                                    format_hms_millis(received_ts)
+                                );
+                                break;
+                            } else {
+                                println!(
+                                    "⚠ Helius sent notification for different transaction: {:?}",
+                                    sig.map(|s| &s[..8])
+                                );
+                            }
                         }
                     }
                 }
@@ -299,8 +331,8 @@ async fn main() -> Result<()> {
     })
     .await;
 
-    let local_ts = *local_notified_at.lock().await;
-    let helius_ts = *helius_notified_at.lock().await;
+    let local_ts = local_notified_at.lock().await.clone();
+    let helius_ts = helius_notified_at.lock().await.clone();
 
     // Print comparison table
     println!("\n┌─────────────────────────────────────────────────────────────────┐");
@@ -309,32 +341,42 @@ async fn main() -> Result<()> {
     println!("│ Source              │ Notification Time         │ Latency (ms)  │");
     println!("├─────────────────────┼───────────────────────────┼───────────────┤");
 
-    if let Some(local_ts) = local_ts {
-        let latency = local_ts.saturating_sub(tx_sent_at);
-        println!(
-            "│ Local WS            │ {} │ {:>13} │",
-            format_timestamp(local_ts),
-            format!("{} ms", latency)
-        );
-    } else {
-        println!(
-            "│ Local WS            │ {:^25} │ {:^13} │",
-            "TIMEOUT", "N/A"
-        );
+    let local_ts_for_table = local_ts;
+    match local_ts_for_table {
+        Some(local_ts_value) => {
+            let latency = local_ts_value.saturating_sub(tx_sent_at);
+            let latency_str = format_duration_ms(latency);
+            println!(
+                "│ Local WS            │ {:<25} │ {:>13} │",
+                format_human(local_ts_value),
+                latency_str
+            );
+        }
+        None => {
+            println!(
+                "│ Local WS            │ {:^25} │ {:^13} │",
+                "TIMEOUT", "N/A"
+            );
+        }
     }
 
-    if let Some(helius_ts) = helius_ts {
-        let latency = helius_ts.saturating_sub(tx_sent_at);
-        println!(
-            "│ Helius WS           │ {} │ {:>13} │",
-            format_timestamp(helius_ts),
-            format!("{} ms", latency)
-        );
-    } else {
-        println!(
-            "│ Helius WS           │ {:^25} │ {:^13} │",
-            "TIMEOUT", "N/A"
-        );
+    let helius_ts_for_table = helius_ts;
+    match helius_ts_for_table {
+        Some(helius_ts_value) => {
+            let latency = helius_ts_value.saturating_sub(tx_sent_at);
+            let latency_str = format_duration_ms(latency);
+            println!(
+                "│ Helius WS           │ {:<25} │ {:>13} │",
+                format_human(helius_ts_value),
+                latency_str
+            );
+        }
+        None => {
+            println!(
+                "│ Helius WS           │ {:^25} │ {:^13} │",
+                "TIMEOUT", "N/A"
+            );
+        }
     }
 
     println!("└─────────────────────┴───────────────────────────┴───────────────┘");
@@ -342,13 +384,22 @@ async fn main() -> Result<()> {
     // Determine winner
     match (local_ts, helius_ts) {
         (Some(local), Some(helius)) => {
-            let diff = local.abs_diff(helius);
-            if local < helius {
-                println!("\n🏆 Winner: Local WS ({} ms faster)", diff);
-            } else if helius < local {
-                println!("\n🏆 Winner: Helius WS ({} ms faster)", diff);
+            let (diff_ms, helius_faster) = if local <= helius {
+                (helius.saturating_sub(local), false)
             } else {
+                (local.saturating_sub(helius), true)
+            };
+
+            let diff_string = format_duration_ms(diff_ms);
+
+            println!("\nDifference: {}", diff_string);
+
+            if diff_ms == 0 {
                 println!("\n🤝 Tie: Both notified at the same time");
+            } else if helius_faster {
+                println!("\n🏆 Winner: Helius WS ({} faster)", diff_string);
+            } else {
+                println!("\n🏆 Winner: Local WS ({} faster)", diff_string);
             }
         }
         (Some(_), None) => println!("\n🏆 Winner: Local WS (Helius timed out)"),
