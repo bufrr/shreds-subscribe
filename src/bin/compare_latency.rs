@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -290,8 +289,8 @@ async fn main() -> Result<()> {
     // Wait for notifications from both sources
     println!("\n⏳ Waiting for notifications (max 60s)...\n");
 
-    let local_notified_at = Arc::new(Mutex::new(None::<u64>));
-    let helius_notified_at = Arc::new(Mutex::new(None::<u64>));
+    let local_notified_at = Arc::new(AtomicU64::new(0));
+    let helius_notified_at = Arc::new(AtomicU64::new(0));
 
     let local_notified_clone = local_notified_at.clone();
     let helius_notified_clone = helius_notified_at.clone();
@@ -345,7 +344,7 @@ async fn main() -> Result<()> {
                             thread::current().id()
                         );
                         println!(
-                            "[DIAGNOSTIC][local][capture #{}] Captured {} ms (before mutex)",
+                            "[DIAGNOSTIC][local][capture #{}] Captured {} ms (before atomic store)",
                             capture_seq, received_ts
                         );
                     }
@@ -354,22 +353,19 @@ async fn main() -> Result<()> {
                         if value.get("method").and_then(|m| m.as_str())
                             == Some("signatureNotification")
                         {
-                            println!("LOCAL: About to write {} to mutex", received_ts);
-                            {
-                                let mut guard = local_notified_clone.lock().await;
-                                if local_verbose {
-                                    println!(
-                                        "[DIAGNOSTIC][local][capture #{}] Mutex acquired at {} μs",
-                                        capture_seq,
-                                        current_micro_ts()
-                                    );
-                                }
-                                *guard = Some(received_ts);
-                            }
-                            println!("LOCAL: Successfully wrote {} to mutex", received_ts);
+                            println!("LOCAL: About to write {} to atomic store", received_ts);
                             if local_verbose {
                                 println!(
-                                    "[DIAGNOSTIC][local][capture #{}] Stored {} ms (after mutex)",
+                                    "[DIAGNOSTIC][local][capture #{}] Performing atomic store at {} μs",
+                                    capture_seq,
+                                    current_micro_ts()
+                                );
+                            }
+                            local_notified_clone.store(received_ts, Ordering::Relaxed);
+                            println!("LOCAL: Successfully wrote {} to atomic store", received_ts);
+                            if local_verbose {
+                                println!(
+                                    "[DIAGNOSTIC][local][capture #{}] Stored {} ms (after atomic store)",
                                     capture_seq, received_ts
                                 );
                             }
@@ -441,7 +437,7 @@ async fn main() -> Result<()> {
                             thread::current().id()
                         );
                         println!(
-                            "[DIAGNOSTIC][helius][capture #{}] Captured {} ms (before mutex)",
+                            "[DIAGNOSTIC][helius][capture #{}] Captured {} ms (before atomic store)",
                             capture_seq, received_ts
                         );
                     }
@@ -458,22 +454,19 @@ async fn main() -> Result<()> {
                                 .and_then(|s| s.as_str());
 
                             if sig == Some(expected_sig_helius.as_str()) {
-                                println!("HELIUS: About to write {} to mutex", received_ts);
-                                {
-                                    let mut guard = helius_notified_clone.lock().await;
-                                    if helius_verbose {
-                                        println!(
-                                            "[DIAGNOSTIC][helius][capture #{}] Mutex acquired at {} μs",
-                                            capture_seq,
-                                            current_micro_ts()
-                                        );
-                                    }
-                                    *guard = Some(received_ts);
-                                }
-                                println!("HELIUS: Successfully wrote {} to mutex", received_ts);
+                                println!("HELIUS: About to write {} to atomic store", received_ts);
                                 if helius_verbose {
                                     println!(
-                                        "[DIAGNOSTIC][helius][capture #{}] Stored {} ms (after mutex)",
+                                        "[DIAGNOSTIC][helius][capture #{}] Performing atomic store at {} μs",
+                                        capture_seq,
+                                        current_micro_ts()
+                                    );
+                                }
+                                helius_notified_clone.store(received_ts, Ordering::Relaxed);
+                                println!("HELIUS: Successfully wrote {} to atomic store", received_ts);
+                                if helius_verbose {
+                                    println!(
+                                        "[DIAGNOSTIC][helius][capture #{}] Stored {} ms (after atomic store)",
                                         capture_seq, received_ts
                                     );
                                 }
@@ -512,8 +505,18 @@ async fn main() -> Result<()> {
     })
     .await;
 
-    let local_ts = local_notified_at.lock().await.clone();
-    let helius_ts = helius_notified_at.lock().await.clone();
+    let local_ts_raw = local_notified_at.load(Ordering::Relaxed);
+    let helius_ts_raw = helius_notified_at.load(Ordering::Relaxed);
+    let local_ts = if local_ts_raw == 0 {
+        None
+    } else {
+        Some(local_ts_raw)
+    };
+    let helius_ts = if helius_ts_raw == 0 {
+        None
+    } else {
+        Some(helius_ts_raw)
+    };
 
     println!("DEBUG: Read local_ts = {:?}", local_ts);
     println!("DEBUG: Read helius_ts = {:?}", helius_ts);
