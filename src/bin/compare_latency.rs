@@ -11,6 +11,8 @@ use solana_sdk::transaction::Transaction;
 use solana_system_transaction as system_transaction;
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
@@ -45,12 +47,32 @@ struct Args {
 
     #[arg(long, default_value = "0.01", help = "Amount to transfer in SOL")]
     amount: f64,
+
+    #[arg(
+        long,
+        help = "Enable verbose diagnostics for timestamp capture investigation"
+    )]
+    verbose: bool,
 }
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    let system_now = SystemTime::now();
+    let duration = system_now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let millis = duration.as_millis() as u64;
+
+    if VERBOSE_LOGGING.load(Ordering::Relaxed) {
+        let seq = NOW_MS_CALL_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+        let micros = duration.as_micros();
+        println!(
+            "[DIAGNOSTIC][now_ms][seq={}] Captured {} ms ({} μs) [thread {:?}] at {:?}",
+            seq,
+            millis,
+            micros,
+            thread::current().id(),
+            system_now
+        );
+    }
+
+    millis
 }
 
 fn format_duration_ms(duration_ms: u64) -> String {
@@ -71,6 +93,18 @@ fn format_hms_millis(ts_ms: u64) -> String {
     let dt = chrono::DateTime::from_timestamp(secs, sub_ms * 1_000_000)
         .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
     dt.format("%H:%M:%S%.3f").to_string()
+}
+
+// Temporary diagnostics to investigate identical timestamp reporting across WebSocket tasks.
+static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
+static NOW_MS_CALL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn current_micro_ts() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
 }
 
 async fn subscribe_local_ws(
@@ -200,6 +234,12 @@ async fn subscribe_helius_ws(
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Flip global switch for temporary diagnostic logging.
+    VERBOSE_LOGGING.store(args.verbose, Ordering::Relaxed);
+    if args.verbose {
+        println!("[DIAGNOSTIC] Verbose diagnostics enabled");
+    }
+
     // Load keypair
     println!("Loading keypair from {}...", args.keypair);
     let keypair_data = fs::read_to_string(&args.keypair)
@@ -256,17 +296,83 @@ async fn main() -> Result<()> {
     let local_notified_clone = local_notified_at.clone();
     let helius_notified_clone = helius_notified_at.clone();
     let expected_sig_helius = signature.clone();
+    let verbose = args.verbose;
+    let local_verbose = verbose;
+    let helius_verbose = verbose;
 
     let local_task = tokio::spawn(async move {
         while let Some(msg) = local_ws.next().await {
+            if local_verbose {
+                let msg_kind = match &msg {
+                    Ok(Message::Text(_)) => "text",
+                    Ok(Message::Ping(_)) => "ping",
+                    Ok(Message::Pong(_)) => "pong",
+                    Ok(Message::Binary(_)) => "binary",
+                    Ok(Message::Close(_)) => "close",
+                    Ok(_) => "other_ok",
+                    Err(_) => "error",
+                };
+                let micros = current_micro_ts();
+                println!(
+                    "[DIAGNOSTIC][local] stream.next() yielded {} at {} μs [thread {:?}]",
+                    msg_kind,
+                    micros,
+                    thread::current().id()
+                );
+            }
+
             match msg {
                 Ok(Message::Text(text)) => {
+                    let capture_seq = CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+                    if local_verbose {
+                        println!(
+                            "[DIAGNOSTIC][local][capture #{}] Message arrived, capturing timestamp...",
+                            capture_seq
+                        );
+                    }
+
+                    println!("LOCAL: About to capture timestamp");
                     let received_ts = now_ms();
+                    println!("LOCAL: Captured timestamp = {}", received_ts);
+
+                    if local_verbose {
+                        let micros = current_micro_ts();
+                        println!(
+                            "[DIAGNOSTIC][local][capture #{}] Captured {} ms ({} μs) [thread {:?}]",
+                            capture_seq,
+                            received_ts,
+                            micros,
+                            thread::current().id()
+                        );
+                        println!(
+                            "[DIAGNOSTIC][local][capture #{}] Captured {} ms (before mutex)",
+                            capture_seq, received_ts
+                        );
+                    }
+
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if value.get("method").and_then(|m| m.as_str())
                             == Some("signatureNotification")
                         {
-                            *local_notified_clone.lock().await = Some(received_ts);
+                            println!("LOCAL: About to write {} to mutex", received_ts);
+                            {
+                                let mut guard = local_notified_clone.lock().await;
+                                if local_verbose {
+                                    println!(
+                                        "[DIAGNOSTIC][local][capture #{}] Mutex acquired at {} μs",
+                                        capture_seq,
+                                        current_micro_ts()
+                                    );
+                                }
+                                *guard = Some(received_ts);
+                            }
+                            println!("LOCAL: Successfully wrote {} to mutex", received_ts);
+                            if local_verbose {
+                                println!(
+                                    "[DIAGNOSTIC][local][capture #{}] Stored {} ms (after mutex)",
+                                    capture_seq, received_ts
+                                );
+                            }
                             println!(
                                 "✓ Local WS notification received at {}",
                                 format_hms_millis(received_ts)
@@ -276,6 +382,12 @@ async fn main() -> Result<()> {
                     }
                 }
                 Ok(Message::Ping(p)) => {
+                    if local_verbose {
+                        println!(
+                            "[DIAGNOSTIC][local] Responding to ping at {} μs",
+                            current_micro_ts()
+                        );
+                    }
                     let _ = local_ws.send(Message::Pong(p)).await;
                 }
                 Ok(Message::Close(_)) | Err(_) => break,
@@ -286,9 +398,54 @@ async fn main() -> Result<()> {
 
     let helius_task = tokio::spawn(async move {
         while let Some(msg) = helius_ws.next().await {
+            if helius_verbose {
+                let msg_kind = match &msg {
+                    Ok(Message::Text(_)) => "text",
+                    Ok(Message::Ping(_)) => "ping",
+                    Ok(Message::Pong(_)) => "pong",
+                    Ok(Message::Binary(_)) => "binary",
+                    Ok(Message::Close(_)) => "close",
+                    Ok(_) => "other_ok",
+                    Err(_) => "error",
+                };
+                let micros = current_micro_ts();
+                println!(
+                    "[DIAGNOSTIC][helius] stream.next() yielded {} at {} μs [thread {:?}]",
+                    msg_kind,
+                    micros,
+                    thread::current().id()
+                );
+            }
+
             match msg {
                 Ok(Message::Text(text)) => {
+                    let capture_seq = CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+                    if helius_verbose {
+                        println!(
+                            "[DIAGNOSTIC][helius][capture #{}] Message arrived, capturing timestamp...",
+                            capture_seq
+                        );
+                    }
+
+                    println!("HELIUS: About to capture timestamp");
                     let received_ts = now_ms();
+                    println!("HELIUS: Captured timestamp = {}", received_ts);
+
+                    if helius_verbose {
+                        let micros = current_micro_ts();
+                        println!(
+                            "[DIAGNOSTIC][helius][capture #{}] Captured {} ms ({} μs) [thread {:?}]",
+                            capture_seq,
+                            received_ts,
+                            micros,
+                            thread::current().id()
+                        );
+                        println!(
+                            "[DIAGNOSTIC][helius][capture #{}] Captured {} ms (before mutex)",
+                            capture_seq, received_ts
+                        );
+                    }
+
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if value.get("method").and_then(|m| m.as_str())
                             == Some("transactionNotification")
@@ -301,7 +458,25 @@ async fn main() -> Result<()> {
                                 .and_then(|s| s.as_str());
 
                             if sig == Some(expected_sig_helius.as_str()) {
-                                *helius_notified_clone.lock().await = Some(received_ts);
+                                println!("HELIUS: About to write {} to mutex", received_ts);
+                                {
+                                    let mut guard = helius_notified_clone.lock().await;
+                                    if helius_verbose {
+                                        println!(
+                                            "[DIAGNOSTIC][helius][capture #{}] Mutex acquired at {} μs",
+                                            capture_seq,
+                                            current_micro_ts()
+                                        );
+                                    }
+                                    *guard = Some(received_ts);
+                                }
+                                println!("HELIUS: Successfully wrote {} to mutex", received_ts);
+                                if helius_verbose {
+                                    println!(
+                                        "[DIAGNOSTIC][helius][capture #{}] Stored {} ms (after mutex)",
+                                        capture_seq, received_ts
+                                    );
+                                }
                                 println!(
                                     "✓ Helius WS notification received at {}",
                                     format_hms_millis(received_ts)
@@ -317,6 +492,12 @@ async fn main() -> Result<()> {
                     }
                 }
                 Ok(Message::Ping(p)) => {
+                    if helius_verbose {
+                        println!(
+                            "[DIAGNOSTIC][helius] Responding to ping at {} μs",
+                            current_micro_ts()
+                        );
+                    }
                     let _ = helius_ws.send(Message::Pong(p)).await;
                 }
                 Ok(Message::Close(_)) | Err(_) => break,
@@ -333,6 +514,9 @@ async fn main() -> Result<()> {
 
     let local_ts = local_notified_at.lock().await.clone();
     let helius_ts = helius_notified_at.lock().await.clone();
+
+    println!("DEBUG: Read local_ts = {:?}", local_ts);
+    println!("DEBUG: Read helius_ts = {:?}", helius_ts);
 
     // Print comparison table
     println!("\n┌─────────────────────────────────────────────────────────────────┐");
