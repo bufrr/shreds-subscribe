@@ -284,21 +284,11 @@ async fn main() -> Result<()> {
     let (mut helius_ws, _helius_sub_id) =
         subscribe_helius_ws(&args.helius_ws, &signature, &wallet_str).await?;
 
-    // Send transaction
-    println!("\n🚀 Sending transaction...");
-    let tx_sent_at = now_ms();
-    let tx_sent_at_micros = now_micros();
-    client
-        .send_and_confirm_transaction(&tx)
-        .context("Failed to send transaction")?;
-    println!("✓ Transaction sent at {}", format_human(tx_sent_at));
+    println!("\n⏳ Preparing to listen for notifications...\n");
 
-    // Wait for notifications from both sources
-    println!("\n⏳ Waiting for notifications (max 60s)...\n");
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, u128)>(2);
-    let tx_local = tx.clone();
-    let tx_helius = tx.clone();
+    let (notif_tx, mut rx) = tokio::sync::mpsc::channel::<(String, u128)>(2);
+    let tx_local = notif_tx.clone();
+    let tx_helius = notif_tx.clone();
     let expected_sig_helius = signature.clone();
     let verbose = args.verbose;
     let local_verbose = verbose;
@@ -392,13 +382,25 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Send transaction
+    println!("\n🚀 Sending transaction...");
+    let tx_sent_at = now_ms();
+    let tx_sent_at_micros = now_micros();
+    client
+        .send_and_confirm_transaction(&tx)
+        .context("Failed to send transaction")?;
+    println!("✓ Transaction sent at {}", format_human(tx_sent_at));
+
+    // Wait for notifications from both sources
+    println!("\n⏳ Waiting for notifications (max 60s)...\n");
+
     // Wait for both tasks with timeout
     let _ = tokio::time::timeout(Duration::from_secs(60), async {
         tokio::join!(local_task, helius_task)
     })
     .await;
 
-    drop(tx);
+    drop(notif_tx);
     let mut results = Vec::new();
     while let Some((source, micros)) = rx.recv().await {
         results.push((source, micros));
