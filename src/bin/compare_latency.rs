@@ -10,7 +10,6 @@ use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 use solana_system_transaction as system_transaction;
 use std::fs;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -74,8 +73,11 @@ fn now_ms() -> u64 {
     millis
 }
 
-fn format_duration_ms(duration_ms: u64) -> String {
-    format!("{:.3} ms", duration_ms as f64)
+fn now_micros() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0)
 }
 
 fn format_human(ts_ms: u64) -> String {
@@ -94,10 +96,14 @@ fn format_hms_millis(ts_ms: u64) -> String {
     dt.format("%H:%M:%S%.3f").to_string()
 }
 
+fn format_latency(latency_micros: u128) -> String {
+    let latency_ms = latency_micros as f64 / 1_000.0;
+    format!("{:.3} ms ({} μs)", latency_ms, latency_micros)
+}
+
 // Temporary diagnostics to investigate identical timestamp reporting across WebSocket tasks.
 static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
 static NOW_MS_CALL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn current_micro_ts() -> u128 {
     SystemTime::now()
@@ -281,6 +287,7 @@ async fn main() -> Result<()> {
     // Send transaction
     println!("\n🚀 Sending transaction...");
     let tx_sent_at = now_ms();
+    let tx_sent_at_micros = now_micros();
     client
         .send_and_confirm_transaction(&tx)
         .context("Failed to send transaction")?;
@@ -289,11 +296,9 @@ async fn main() -> Result<()> {
     // Wait for notifications from both sources
     println!("\n⏳ Waiting for notifications (max 60s)...\n");
 
-    let local_notified_at = Arc::new(AtomicU64::new(0));
-    let helius_notified_at = Arc::new(AtomicU64::new(0));
-
-    let local_notified_clone = local_notified_at.clone();
-    let helius_notified_clone = helius_notified_at.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, u128)>(2);
+    let tx_local = tx.clone();
+    let tx_helius = tx.clone();
     let expected_sig_helius = signature.clone();
     let verbose = args.verbose;
     let local_verbose = verbose;
@@ -301,77 +306,19 @@ async fn main() -> Result<()> {
 
     let local_task = tokio::spawn(async move {
         while let Some(msg) = local_ws.next().await {
-            if local_verbose {
-                let msg_kind = match &msg {
-                    Ok(Message::Text(_)) => "text",
-                    Ok(Message::Ping(_)) => "ping",
-                    Ok(Message::Pong(_)) => "pong",
-                    Ok(Message::Binary(_)) => "binary",
-                    Ok(Message::Close(_)) => "close",
-                    Ok(_) => "other_ok",
-                    Err(_) => "error",
-                };
-                let micros = current_micro_ts();
-                println!(
-                    "[DIAGNOSTIC][local] stream.next() yielded {} at {} μs [thread {:?}]",
-                    msg_kind,
-                    micros,
-                    thread::current().id()
-                );
-            }
-
             match msg {
                 Ok(Message::Text(text)) => {
-                    let capture_seq = CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-                    if local_verbose {
-                        println!(
-                            "[DIAGNOSTIC][local][capture #{}] Message arrived, capturing timestamp...",
-                            capture_seq
-                        );
-                    }
-
-                    println!("LOCAL: About to capture timestamp");
-                    let received_ts = now_ms();
-                    println!("LOCAL: Captured timestamp = {}", received_ts);
-
-                    if local_verbose {
-                        let micros = current_micro_ts();
-                        println!(
-                            "[DIAGNOSTIC][local][capture #{}] Captured {} ms ({} μs) [thread {:?}]",
-                            capture_seq,
-                            received_ts,
-                            micros,
-                            thread::current().id()
-                        );
-                        println!(
-                            "[DIAGNOSTIC][local][capture #{}] Captured {} ms (before atomic store)",
-                            capture_seq, received_ts
-                        );
-                    }
-
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if value.get("method").and_then(|m| m.as_str())
                             == Some("signatureNotification")
                         {
-                            println!("LOCAL: About to write {} to atomic store", received_ts);
-                            if local_verbose {
-                                println!(
-                                    "[DIAGNOSTIC][local][capture #{}] Performing atomic store at {} μs",
-                                    capture_seq,
-                                    current_micro_ts()
-                                );
-                            }
-                            local_notified_clone.store(received_ts, Ordering::Relaxed);
-                            println!("LOCAL: Successfully wrote {} to atomic store", received_ts);
-                            if local_verbose {
-                                println!(
-                                    "[DIAGNOSTIC][local][capture #{}] Stored {} ms (after atomic store)",
-                                    capture_seq, received_ts
-                                );
-                            }
+                            let received_micros = now_micros();
+                            let _ = tx_local.send(("LOCAL".to_string(), received_micros)).await;
+                            let received_ms = (received_micros / 1_000) as u64;
                             println!(
-                                "✓ Local WS notification received at {}",
-                                format_hms_millis(received_ts)
+                                "✓ Local WS notification received at {} ({} μs)",
+                                format_hms_millis(received_ms),
+                                received_micros
                             );
                             break;
                         }
@@ -394,54 +341,8 @@ async fn main() -> Result<()> {
 
     let helius_task = tokio::spawn(async move {
         while let Some(msg) = helius_ws.next().await {
-            if helius_verbose {
-                let msg_kind = match &msg {
-                    Ok(Message::Text(_)) => "text",
-                    Ok(Message::Ping(_)) => "ping",
-                    Ok(Message::Pong(_)) => "pong",
-                    Ok(Message::Binary(_)) => "binary",
-                    Ok(Message::Close(_)) => "close",
-                    Ok(_) => "other_ok",
-                    Err(_) => "error",
-                };
-                let micros = current_micro_ts();
-                println!(
-                    "[DIAGNOSTIC][helius] stream.next() yielded {} at {} μs [thread {:?}]",
-                    msg_kind,
-                    micros,
-                    thread::current().id()
-                );
-            }
-
             match msg {
                 Ok(Message::Text(text)) => {
-                    let capture_seq = CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-                    if helius_verbose {
-                        println!(
-                            "[DIAGNOSTIC][helius][capture #{}] Message arrived, capturing timestamp...",
-                            capture_seq
-                        );
-                    }
-
-                    println!("HELIUS: About to capture timestamp");
-                    let received_ts = now_ms();
-                    println!("HELIUS: Captured timestamp = {}", received_ts);
-
-                    if helius_verbose {
-                        let micros = current_micro_ts();
-                        println!(
-                            "[DIAGNOSTIC][helius][capture #{}] Captured {} ms ({} μs) [thread {:?}]",
-                            capture_seq,
-                            received_ts,
-                            micros,
-                            thread::current().id()
-                        );
-                        println!(
-                            "[DIAGNOSTIC][helius][capture #{}] Captured {} ms (before atomic store)",
-                            capture_seq, received_ts
-                        );
-                    }
-
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if value.get("method").and_then(|m| m.as_str())
                             == Some("transactionNotification")
@@ -454,25 +355,15 @@ async fn main() -> Result<()> {
                                 .and_then(|s| s.as_str());
 
                             if sig == Some(expected_sig_helius.as_str()) {
-                                println!("HELIUS: About to write {} to atomic store", received_ts);
-                                if helius_verbose {
-                                    println!(
-                                        "[DIAGNOSTIC][helius][capture #{}] Performing atomic store at {} μs",
-                                        capture_seq,
-                                        current_micro_ts()
-                                    );
-                                }
-                                helius_notified_clone.store(received_ts, Ordering::Relaxed);
-                                println!("HELIUS: Successfully wrote {} to atomic store", received_ts);
-                                if helius_verbose {
-                                    println!(
-                                        "[DIAGNOSTIC][helius][capture #{}] Stored {} ms (after atomic store)",
-                                        capture_seq, received_ts
-                                    );
-                                }
+                                let received_micros = now_micros();
+                                let _ = tx_helius
+                                    .send(("HELIUS".to_string(), received_micros))
+                                    .await;
+                                let received_ms = (received_micros / 1_000) as u64;
                                 println!(
-                                    "✓ Helius WS notification received at {}",
-                                    format_hms_millis(received_ts)
+                                    "✓ Helius WS notification received at {} ({} μs)",
+                                    format_hms_millis(received_ms),
+                                    received_micros
                                 );
                                 break;
                             } else {
@@ -505,83 +396,83 @@ async fn main() -> Result<()> {
     })
     .await;
 
-    let local_ts_raw = local_notified_at.load(Ordering::Relaxed);
-    let helius_ts_raw = helius_notified_at.load(Ordering::Relaxed);
-    let local_ts = if local_ts_raw == 0 {
-        None
-    } else {
-        Some(local_ts_raw)
-    };
-    let helius_ts = if helius_ts_raw == 0 {
-        None
-    } else {
-        Some(helius_ts_raw)
-    };
+    drop(tx);
+    let mut results = Vec::new();
+    while let Some((source, micros)) = rx.recv().await {
+        results.push((source, micros));
+    }
+    results.sort_by_key(|entry| entry.1);
 
-    println!("DEBUG: Read local_ts = {:?}", local_ts);
-    println!("DEBUG: Read helius_ts = {:?}", helius_ts);
+    let mut local_micros: Option<u128> = None;
+    let mut helius_micros: Option<u128> = None;
+
+    for (source, micros) in &results {
+        match source.as_str() {
+            "LOCAL" => local_micros = Some(*micros),
+            "HELIUS" => helius_micros = Some(*micros),
+            _ => {}
+        }
+    }
 
     // Print comparison table
     println!("\n┌─────────────────────────────────────────────────────────────────┐");
     println!("│                    LATENCY COMPARISON                           │");
-    println!("├─────────────────────┬───────────────────────────┬───────────────┤");
-    println!("│ Source              │ Notification Time         │ Latency (ms)  │");
-    println!("├─────────────────────┼───────────────────────────┼───────────────┤");
+    println!("├─────────────────────┬───────────────────────────┬─────────────────────┤");
+    println!("│ Source              │ Notification Time         │ Latency (ms / μs)   │");
+    println!("├─────────────────────┼───────────────────────────┼─────────────────────┤");
 
-    let local_ts_for_table = local_ts;
-    match local_ts_for_table {
-        Some(local_ts_value) => {
-            let latency = local_ts_value.saturating_sub(tx_sent_at);
-            let latency_str = format_duration_ms(latency);
+    match local_micros {
+        Some(local_value) => {
+            let local_ms = (local_value / 1_000) as u64;
+            let latency_micros = local_value.saturating_sub(tx_sent_at_micros);
             println!(
-                "│ Local WS            │ {:<25} │ {:>13} │",
-                format_human(local_ts_value),
-                latency_str
+                "│ Local WS            │ {:<25} │ {:>19} │",
+                format_human(local_ms),
+                format_latency(latency_micros)
             );
         }
         None => {
             println!(
-                "│ Local WS            │ {:^25} │ {:^13} │",
+                "│ Local WS            │ {:^25} │ {:^19} │",
                 "TIMEOUT", "N/A"
             );
         }
     }
 
-    let helius_ts_for_table = helius_ts;
-    match helius_ts_for_table {
-        Some(helius_ts_value) => {
-            let latency = helius_ts_value.saturating_sub(tx_sent_at);
-            let latency_str = format_duration_ms(latency);
+    match helius_micros {
+        Some(helius_value) => {
+            let helius_ms = (helius_value / 1_000) as u64;
+            let latency_micros = helius_value.saturating_sub(tx_sent_at_micros);
             println!(
-                "│ Helius WS           │ {:<25} │ {:>13} │",
-                format_human(helius_ts_value),
-                latency_str
+                "│ Helius WS           │ {:<25} │ {:>19} │",
+                format_human(helius_ms),
+                format_latency(latency_micros)
             );
         }
         None => {
             println!(
-                "│ Helius WS           │ {:^25} │ {:^13} │",
+                "│ Helius WS           │ {:^25} │ {:^19} │",
                 "TIMEOUT", "N/A"
             );
         }
     }
 
-    println!("└─────────────────────┴───────────────────────────┴───────────────┘");
+    println!("└─────────────────────┴───────────────────────────┴─────────────────────┘");
 
     // Determine winner
-    match (local_ts, helius_ts) {
+    match (local_micros, helius_micros) {
         (Some(local), Some(helius)) => {
-            let (diff_ms, helius_faster) = if local <= helius {
+            let (diff_micros, helius_faster) = if local <= helius {
                 (helius.saturating_sub(local), false)
             } else {
                 (local.saturating_sub(helius), true)
             };
 
-            let diff_string = format_duration_ms(diff_ms);
+            let diff_string = format_latency(diff_micros);
 
             println!("\nDifference: {}", diff_string);
 
-            if diff_ms == 0 {
+            if diff_micros == 0 {
                 println!("\n🤝 Tie: Both notified at the same time");
             } else if helius_faster {
                 println!("\n🏆 Winner: Helius WS ({} faster)", diff_string);
