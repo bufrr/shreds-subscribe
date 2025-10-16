@@ -1,6 +1,7 @@
-use crate::rpc::Subscription;
+use crate::rpc::{Subscription, WebsocketSubscription};
 use dashmap::DashMap;
 use itertools::Itertools;
+use serde_json::json;
 use solana_ledger::blockstore::MAX_DATA_SHREDS_PER_SLOT;
 use solana_ledger::shred::{
     ReedSolomonCache, ShredType, Shredder,
@@ -19,11 +20,15 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 // Fixed identifiers for structured trace logs
 const CHAIN_ID: u32 = 501;
 const PROCESS: u32 = 11011;
 const PROCESS_WORD: &str = "node_e2e_shreds_parse";
+
+type NotificationMessage = (String, u64, WebsocketSubscription);
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 enum ShredStatus {
@@ -66,6 +71,22 @@ pub async fn reconstruct_shreds_server(
 ) -> anyhow::Result<()> {
     let exit = Arc::new(AtomicBool::new(false));
 
+    let (notif_tx, mut notif_rx) = tokio_mpsc::unbounded_channel::<NotificationMessage>();
+    tokio::spawn({
+        async move {
+            while let Some((tx_sig, slot, websocket)) = notif_rx.recv().await {
+                let payload = format!(
+                    r#"{{"jsonrpc":"2.0","method":"signatureNotification","params":{{"subscription":{},"result":{{"context":{{"slot":{}}},"value":{{"err":null}}}}}}}}"#,
+                    websocket.id, slot
+                );
+
+                if websocket.sender.try_send(Message::Text(payload)).is_err() {
+                    debug!("Failed to send notification for {}", tx_sig);
+                }
+            }
+        }
+    });
+
     // Setup log file if provided
     let trace_log_file = if let Some(ref path) = trace_log_path {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -74,6 +95,7 @@ pub async fn reconstruct_shreds_server(
         None
     };
 
+    let notif_tx_thread = notif_tx.clone();
     let handle = thread::spawn({
         let exit_clone = Arc::clone(&exit);
         move || {
@@ -88,6 +110,7 @@ pub async fn reconstruct_shreds_server(
             let mut highest_slot_seen: Slot = 0;
             let rs_cache = ReedSolomonCache::default();
 
+            let notif_tx = notif_tx_thread;
             while !exit_clone.load(Ordering::Relaxed) {
                 if let Ok(packet_batch) = reconstruct_tx.recv_timeout(Duration::from_millis(100)) {
                     reconstruct_shreds(
@@ -98,11 +121,14 @@ pub async fn reconstruct_shreds_server(
                         &rs_cache,
                         &subscriptions,
                         &trace_log_file,
+                        &notif_tx,
                     );
                 }
             }
         }
     });
+
+    drop(notif_tx);
 
     shutdown_rx.recv().await?;
     exit.store(true, Ordering::Relaxed);
@@ -125,6 +151,7 @@ pub fn reconstruct_shreds(
     rs_cache: &ReedSolomonCache,
     subscriptions: &Arc<DashMap<String, Subscription>>,
     trace_log_file: &Option<Arc<Mutex<std::fs::File>>>,
+    notif_tx: &tokio_mpsc::UnboundedSender<NotificationMessage>,
 ) -> usize {
     slot_fec_indexes_set.clear();
     // ingest all packets
@@ -302,7 +329,7 @@ pub fn reconstruct_shreds(
                 };
 
                 // Check if anyone is waiting for this transaction
-                if let Some((_, subscription)) = subscriptions.remove(&tx_sig) {
+                if let Some((_, mut subscription)) = subscriptions.remove(&tx_sig) {
                     // Compute latency metrics using shred received timestamp
                     let total_latency_ms =
                         shred_received_at_ms.saturating_sub(subscription.client_timestamp_ms);
@@ -323,6 +350,12 @@ pub fn reconstruct_shreds(
                         subscription.rpc_received_ms,
                         shred_received_at_ms
                     );
+
+                    if let Some(websocket) = subscription.websocket.take() {
+                        if notif_tx.send((tx_sig.clone(), *slot, websocket)).is_err() {
+                            debug!("Failed to queue notification for {}", tx_sig);
+                        }
+                    }
 
                     // Write structured log to file if provided (use shred received timestamp)
                     if let Some(log_file) = trace_log_file {

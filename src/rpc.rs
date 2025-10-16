@@ -8,12 +8,21 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::Sender;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::info;
 
 #[derive(Debug)]
 pub struct Subscription {
     pub client_timestamp_ms: u64, // Client-provided timestamp for latency tracking
     pub rpc_received_ms: u64,     // Server timestamp when RPC was received
+    pub websocket: Option<WebsocketSubscription>,
+}
+
+#[derive(Debug)]
+pub struct WebsocketSubscription {
+    pub id: u64,
+    pub sender: Sender<Message>,
 }
 
 // New struct for the immediate success response
@@ -93,6 +102,7 @@ impl Rpc for RpcImpl {
         let subscription = Subscription {
             client_timestamp_ms: timestamp_ms,
             rpc_received_ms,
+            websocket: None,
         };
 
         // Try to insert the subscription

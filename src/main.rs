@@ -1,6 +1,7 @@
 mod deshred;
 mod rpc;
 mod shred;
+mod websocket;
 
 use clap::Parser;
 use dashmap::DashMap;
@@ -37,6 +38,9 @@ struct Args {
     #[arg(long, env = "RPC_PORT", help = "Port for RPC server")]
     rpc_port: Option<u16>,
 
+    #[arg(long, env = "WS_PORT", help = "Port for WebSocket server")]
+    ws_port: Option<u16>,
+
     #[arg(long, env = "CONFIG_PATH", help = "Path to a config TOML file")]
     config_path: Option<String>,
 }
@@ -45,6 +49,7 @@ struct Args {
 struct Config {
     udp_port: Option<u16>,
     rpc_port: Option<u16>,
+    ws_port: Option<u16>,
     trace_log_path: Option<String>,
     log_path: Option<String>,
 }
@@ -108,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     // CLI args override config file
     config.udp_port = args.udp_port.or(config.udp_port);
     config.rpc_port = args.rpc_port.or(config.rpc_port);
+    config.ws_port = args.ws_port.or(config.ws_port);
     config.log_path = args.log_path.or(config.log_path);
     config.trace_log_path = args.trace_log_path.or(config.trace_log_path);
 
@@ -117,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
     // Get final configuration values
     let udp_port = config.udp_port.unwrap_or(18888);
     let rpc_port = config.rpc_port.unwrap_or(12345);
+    let ws_port = config.ws_port.unwrap_or(38899);
 
     // Trace log is for structured transaction data (handled separately by deshred module)
     let trace_log_path = config.trace_log_path;
@@ -126,11 +133,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Shared subscriptions map for RPC and deshred
     let subscriptions = Arc::new(DashMap::<String, Subscription>::new());
+    let deshred_subscriptions = subscriptions.clone();
+    let ws_subscriptions = subscriptions.clone();
 
     // Start RPC server
     let rpc_addr: SocketAddr = format!("0.0.0.0:{}", rpc_port).parse()?;
     let rpc_server = rpc::start_rpc_server(rpc_addr, subscriptions.clone()).await?;
     info!("RPC server started on port {}", rpc_port);
+
+    let ws_addr: SocketAddr = format!("0.0.0.0:{}", ws_port).parse()?;
+    let ws_shutdown = shutdown_tx.subscribe();
+    let ws_handle = tokio::spawn(async move {
+        if let Err(e) =
+            websocket::start_websocket_server(ws_addr, ws_subscriptions, ws_shutdown, 10_000).await
+        {
+            error!("WebSocket server error: {:?}", e);
+        }
+    });
 
     // udp server
     let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
@@ -148,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = deshred::reconstruct_shreds_server(
             reconstruct_shutdown,
             reconstruct_rx,
-            subscriptions,
+            deshred_subscriptions,
             trace_log_path,
         )
         .await;
@@ -165,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     udp_handle.await?;
+    ws_handle.await?;
     reconstruct_handle.await?;
     let _ = rpc_close.join();
 
