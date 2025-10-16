@@ -308,11 +308,12 @@ async fn main() -> Result<()> {
         while let Some(msg) = local_ws.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
+                    let received_micros = now_micros();
+
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if value.get("method").and_then(|m| m.as_str())
                             == Some("signatureNotification")
                         {
-                            let received_micros = now_micros();
                             let _ = tx_local.send(("LOCAL".to_string(), received_micros)).await;
                             let received_ms = (received_micros / 1_000) as u64;
                             println!(
@@ -343,6 +344,8 @@ async fn main() -> Result<()> {
         while let Some(msg) = helius_ws.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
+                    let received_micros = now_micros();
+
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if value.get("method").and_then(|m| m.as_str())
                             == Some("transactionNotification")
@@ -355,7 +358,6 @@ async fn main() -> Result<()> {
                                 .and_then(|s| s.as_str());
 
                             if sig == Some(expected_sig_helius.as_str()) {
-                                let received_micros = now_micros();
                                 let _ = tx_helius
                                     .send(("HELIUS".to_string(), received_micros))
                                     .await;
