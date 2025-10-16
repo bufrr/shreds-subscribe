@@ -98,7 +98,7 @@ fn format_hms_millis(ts_ms: u64) -> String {
 
 fn format_latency(latency_micros: u128) -> String {
     let latency_ms = latency_micros as f64 / 1_000.0;
-    format!("{:.3} ms ({} μs)", latency_ms, latency_micros)
+    format!("{:.3} ms", latency_ms)
 }
 
 // Temporary diagnostics to investigate identical timestamp reporting across WebSocket tasks.
@@ -307,9 +307,8 @@ async fn main() -> Result<()> {
                             let _ = tx_local.send(("LOCAL".to_string(), received_micros)).await;
                             let received_ms = (received_micros / 1_000) as u64;
                             println!(
-                                "✓ Local WS notification received at {} ({} μs)",
-                                format_hms_millis(received_ms),
-                                received_micros
+                                "✓ Local WS notification received at {}",
+                                format_hms_millis(received_ms)
                             );
                             break;
                         }
@@ -353,9 +352,8 @@ async fn main() -> Result<()> {
                                     .await;
                                 let received_ms = (received_micros / 1_000) as u64;
                                 println!(
-                                    "✓ Helius WS notification received at {} ({} μs)",
-                                    format_hms_millis(received_ms),
-                                    received_micros
+                                    "✓ Helius WS notification received at {}",
+                                    format_hms_millis(received_ms)
                                 );
                                 break;
                             } else {
@@ -419,27 +417,23 @@ async fn main() -> Result<()> {
     }
 
     // Print comparison table
-    println!("\n┌─────────────────────────────────────────────────────────────────┐");
-    println!("│                    LATENCY COMPARISON                           │");
-    println!("├─────────────────────┬───────────────────────────┬─────────────────────┤");
-    println!("│ Source              │ Notification Time         │ Latency (ms / μs)   │");
-    println!("├─────────────────────┼───────────────────────────┼─────────────────────┤");
+    println!("\n┌──────────────────┬───────────────────────────┬──────────────┐");
+    println!("│ Source           │ Notification Time         │ Latency (ms) │");
+    println!("├──────────────────┼───────────────────────────┼──────────────┤");
 
     match local_micros {
         Some(local_value) => {
             let local_ms = (local_value / 1_000) as u64;
             let latency_micros = local_value.saturating_sub(tx_sent_at_micros);
             println!(
-                "│ Local WS            │ {:<25} │ {:>19} │",
+                "│ {:<16} │ {:<25} │ {:>12} │",
+                "Local WS",
                 format_human(local_ms),
                 format_latency(latency_micros)
             );
         }
         None => {
-            println!(
-                "│ Local WS            │ {:^25} │ {:^19} │",
-                "TIMEOUT", "N/A"
-            );
+            println!("│ {:<16} │ {:^25} │ {:^12} │", "Local WS", "TIMEOUT", "N/A");
         }
     }
 
@@ -448,20 +442,21 @@ async fn main() -> Result<()> {
             let helius_ms = (helius_value / 1_000) as u64;
             let latency_micros = helius_value.saturating_sub(tx_sent_at_micros);
             println!(
-                "│ Helius WS           │ {:<25} │ {:>19} │",
+                "│ {:<16} │ {:<25} │ {:>12} │",
+                "Helius WS",
                 format_human(helius_ms),
                 format_latency(latency_micros)
             );
         }
         None => {
             println!(
-                "│ Helius WS           │ {:^25} │ {:^19} │",
-                "TIMEOUT", "N/A"
+                "│ {:<16} │ {:^25} │ {:^12} │",
+                "Helius WS", "TIMEOUT", "N/A"
             );
         }
     }
 
-    println!("└─────────────────────┴───────────────────────────┴─────────────────────┘");
+    println!("└──────────────────┴───────────────────────────┴──────────────┘");
 
     // Determine winner
     match (local_micros, helius_micros) {
