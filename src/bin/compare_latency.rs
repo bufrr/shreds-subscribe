@@ -3,7 +3,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::hash::Hash;
 use solana_sdk::native_token::LAMPORTS_PER_SOL;
 use solana_sdk::signature::{Keypair, Signer};
@@ -76,7 +76,7 @@ async fn subscribe_local_ws(
         "params": [signature, {"commitment": "confirmed"}]
     });
 
-    ws.send(Message::Text(request.to_string()))
+    ws.send(Message::Text(request.to_string().into()))
         .await
         .context("Failed to send signatureSubscribe")?;
 
@@ -137,7 +137,7 @@ async fn subscribe_helius_ws(
         ]
     });
 
-    ws.send(Message::Text(request.to_string()))
+    ws.send(Message::Text(request.to_string().into()))
         .await
         .context("Failed to send transactionSubscribe")?;
 
@@ -179,7 +179,14 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to read keypair file: {}", args.keypair))?;
     let keypair_bytes: Vec<u8> = serde_json::from_str(&keypair_data)
         .context("Failed to parse keypair JSON (expected array of 64 bytes)")?;
-    let keypair = Keypair::from_bytes(&keypair_bytes).context("Invalid keypair bytes")?;
+
+    // Extract the first 32 bytes as the secret key
+    if keypair_bytes.len() < 32 {
+        anyhow::bail!("Keypair file must contain at least 32 bytes");
+    }
+    let mut secret_key = [0u8; 32];
+    secret_key.copy_from_slice(&keypair_bytes[..32]);
+    let keypair = Keypair::new_from_array(secret_key);
 
     println!("Wallet: {}", keypair.pubkey());
 
@@ -269,10 +276,9 @@ async fn main() -> Result<()> {
     });
 
     // Wait for both tasks with timeout
-    let _ = tokio::time::timeout(
-        Duration::from_secs(60),
-        tokio::join!(local_task, helius_task),
-    )
+    let _ = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(local_task, helius_task)
+    })
     .await;
 
     let local_ts = *local_notified_at.lock().await;

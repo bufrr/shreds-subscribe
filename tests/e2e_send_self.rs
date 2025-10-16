@@ -99,7 +99,7 @@ async fn subscribe_ws(ws_url: &str, tx_sig: &str) -> anyhow::Result<(WsStream, u
         ],
     });
     ws_stream
-        .send(Message::Text(payload.to_string()))
+        .send(Message::Text(payload.to_string().into()))
         .await
         .context("failed to send signatureSubscribe request")?;
 

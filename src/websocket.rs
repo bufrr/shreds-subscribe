@@ -453,7 +453,7 @@ fn send_result(outbound: &mpsc::Sender<Message>, id: Value, result: Value) {
         "id": id,
     });
     if let Ok(text) = serde_json::to_string(&response) {
-        if outbound.try_send(Message::Text(text)).is_err() {
+        if outbound.try_send(Message::Text(text.into())).is_err() {
             debug!("Client channel full, dropping result response");
         }
     }
@@ -469,7 +469,7 @@ fn send_error(outbound: &mpsc::Sender<Message>, id: Value, code: i64, message: &
         "id": id,
     });
     if let Ok(text) = serde_json::to_string(&response) {
-        if outbound.try_send(Message::Text(text)).is_err() {
+        if outbound.try_send(Message::Text(text.into())).is_err() {
             debug!("Client channel full, dropping error response");
         }
     }

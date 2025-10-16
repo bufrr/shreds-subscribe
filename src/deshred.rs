@@ -1,7 +1,6 @@
 use crate::rpc::{Subscription, WebsocketSubscription};
 use dashmap::DashMap;
 use itertools::Itertools;
-use serde_json::json;
 use solana_ledger::blockstore::MAX_DATA_SHREDS_PER_SLOT;
 use solana_ledger::shred::{
     ReedSolomonCache, ShredType, Shredder,
@@ -80,7 +79,11 @@ pub async fn reconstruct_shreds_server(
                     websocket.id, slot
                 );
 
-                if websocket.sender.try_send(Message::Text(payload)).is_err() {
+                if websocket
+                    .sender
+                    .try_send(Message::Text(payload.into()))
+                    .is_err()
+                {
                     debug!("Failed to send notification for {}", tx_sig);
                 }
             }
