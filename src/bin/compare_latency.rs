@@ -26,7 +26,11 @@ struct Args {
     #[arg(long, help = "Path to keypair JSON file")]
     keypair: String,
 
-    #[arg(long, default_value = "http://127.0.0.1:8899", help = "Solana RPC URL")]
+    #[arg(
+        long,
+        default_value = "https://api.mainnet-beta.solana.com",
+        help = "Solana RPC URL"
+    )]
     rpc_url: String,
 
     #[arg(
@@ -111,6 +115,7 @@ async fn subscribe_local_ws(
 async fn subscribe_helius_ws(
     ws_url: &str,
     signature: &str,
+    wallet_pubkey: &str,
 ) -> Result<(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     u64,
@@ -125,8 +130,8 @@ async fn subscribe_helius_ws(
         "method": "transactionSubscribe",
         "params": [
             {
-                "signature": signature,
-                "failed": false
+                "failed": false,
+                "accountInclude": [wallet_pubkey]
             },
             {
                 "commitment": "confirmed",
@@ -160,10 +165,21 @@ async fn subscribe_helius_ws(
 
     let value: serde_json::Value =
         serde_json::from_str(&response_text).context("Failed to parse subscription response")?;
+
+    // Check for error response
+    if let Some(error) = value.get("error") {
+        anyhow::bail!("Helius subscription error: {}", error);
+    }
+
+    // Handle both number and string subscription IDs
     let sub_id = value
         .get("result")
-        .and_then(|v| v.as_u64())
-        .context("Missing subscription ID")?;
+        .and_then(|v| {
+            // Try as u64 first, then try parsing string as u64
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .with_context(|| format!("Missing subscription ID. Response: {}", response_text))?;
 
     println!("✓ Helius WS subscribed (ID: {})", sub_id);
     Ok((ws, sub_id))
@@ -207,8 +223,10 @@ async fn main() -> Result<()> {
 
     // Subscribe to both WebSockets BEFORE sending transaction
     println!("\n📡 Subscribing to WebSockets...");
+    let wallet_str = keypair.pubkey().to_string();
     let (mut local_ws, _local_sub_id) = subscribe_local_ws(&args.local_ws, &signature).await?;
-    let (mut helius_ws, _helius_sub_id) = subscribe_helius_ws(&args.helius_ws, &signature).await?;
+    let (mut helius_ws, _helius_sub_id) =
+        subscribe_helius_ws(&args.helius_ws, &signature, &wallet_str).await?;
 
     // Send transaction
     println!("\n🚀 Sending transaction...");
