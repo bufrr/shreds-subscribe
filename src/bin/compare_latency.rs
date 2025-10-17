@@ -10,17 +10,18 @@ use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 use solana_system_transaction as system_transaction;
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Parser)]
 #[command(
     author,
     version,
-    about = "Compare latency between local and Helius WebSocket notifications"
+    about = "Compare latency between Shred, local, and Helius WebSocket notifications"
 )]
 struct Args {
     #[arg(long, help = "Path to keypair JSON file")]
@@ -33,44 +34,20 @@ struct Args {
     )]
     rpc_url: String,
 
+    #[arg(long, help = "Shred WebSocket URL (e.g., ws://127.0.0.1:38899)")]
+    shred_ws: Option<String>,
+
     #[arg(
         long,
-        default_value = "ws://127.0.0.1:38899",
-        help = "Local WebSocket URL"
+        help = "Standard Solana RPC WebSocket URL (e.g., ws://127.0.0.1:8900)"
     )]
-    local_ws: String,
+    local_ws: Option<String>,
 
     #[arg(long, help = "Helius WebSocket URL (including ?api-key=YOUR_KEY)")]
-    helius_ws: String,
+    helius_ws: Option<String>,
 
     #[arg(long, default_value = "0.01", help = "Amount to transfer in SOL")]
     amount: f64,
-
-    #[arg(
-        long,
-        help = "Enable verbose diagnostics for timestamp capture investigation"
-    )]
-    verbose: bool,
-}
-fn now_ms() -> u64 {
-    let system_now = SystemTime::now();
-    let duration = system_now.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let millis = duration.as_millis() as u64;
-
-    if VERBOSE_LOGGING.load(Ordering::Relaxed) {
-        let seq = NOW_MS_CALL_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-        let micros = duration.as_micros();
-        println!(
-            "[DIAGNOSTIC][now_ms][seq={}] Captured {} ms ({} μs) [thread {:?}] at {:?}",
-            seq,
-            millis,
-            micros,
-            thread::current().id(),
-            system_now
-        );
-    }
-
-    millis
 }
 
 fn now_micros() -> u128 {
@@ -101,33 +78,60 @@ fn format_latency(latency_micros: u128) -> String {
     format!("{:.3} ms", latency_ms)
 }
 
-// Temporary diagnostics to investigate identical timestamp reporting across WebSocket tasks.
-static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
-static NOW_MS_CALL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-fn current_micro_ts() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros()
-}
-
-async fn subscribe_local_ws(
-    ws_url: &str,
-    signature: &str,
-) -> Result<(
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    u64,
-)> {
+async fn subscribe_shred_ws(ws_url: &str, signature: &str) -> Result<(WsStream, u64)> {
     let (mut ws, _) = connect_async(ws_url)
         .await
-        .context("Failed to connect to local WebSocket")?;
+        .context("Failed to connect to Shred WebSocket")?;
 
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "signatureSubscribe",
-        "params": [signature, {"commitment": "confirmed"}]
+        "params": [signature, {"commitment": "processed"}]
+    });
+
+    ws.send(Message::Text(request.to_string().into()))
+        .await
+        .context("Failed to send signatureSubscribe")?;
+
+    let response_text = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => break Ok(text),
+                Some(Ok(Message::Ping(p))) => {
+                    ws.send(Message::Pong(p)).await?;
+                }
+                Some(Ok(Message::Close(_))) => anyhow::bail!("WebSocket closed"),
+                Some(Err(e)) => return Err(e.into()),
+                None => anyhow::bail!("WebSocket closed"),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .context("Timeout waiting for subscription response")??;
+
+    let value: serde_json::Value =
+        serde_json::from_str(&response_text).context("Failed to parse subscription response")?;
+    let sub_id = value
+        .get("result")
+        .and_then(|v| v.as_u64())
+        .context("Missing subscription ID")?;
+
+    println!("✓ Shred WS subscribed (ID: {})", sub_id);
+    Ok((ws, sub_id))
+}
+
+async fn subscribe_solana_ws(ws_url: &str, signature: &str) -> Result<(WsStream, u64)> {
+    let (mut ws, _) = connect_async(ws_url)
+        .await
+        .context("Failed to connect to standard Solana WebSocket")?;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "signatureSubscribe",
+        "params": [signature, {"commitment": "processed"}]
     });
 
     ws.send(Message::Text(request.to_string().into()))
@@ -166,10 +170,7 @@ async fn subscribe_helius_ws(
     ws_url: &str,
     _signature: &str,
     wallet_pubkey: &str,
-) -> Result<(
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    u64,
-)> {
+) -> Result<(WsStream, u64)> {
     let (mut ws, _) = connect_async(ws_url)
         .await
         .context("Failed to connect to Helius WebSocket")?;
@@ -184,7 +185,7 @@ async fn subscribe_helius_ws(
                 "accountInclude": [wallet_pubkey]
             },
             {
-                "commitment": "confirmed",
+                "commitment": "processed",
                 "encoding": "jsonParsed",
                 "transactionDetails": "full",
                 "maxSupportedTransactionVersion": 0
@@ -235,15 +236,98 @@ async fn subscribe_helius_ws(
     Ok((ws, sub_id))
 }
 
+async fn handle_ws_message(
+    msg: Result<Message, WsError>,
+    expected_method: &str,
+    source_name: &str,
+    signature_filter: Option<&str>,
+    tx: &tokio::sync::mpsc::Sender<(String, u128)>,
+    ws: &mut WsStream,
+) -> bool {
+    match msg {
+        Ok(Message::Text(text)) => {
+            let received_micros = now_micros();
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                if value.get("method").and_then(|m| m.as_str()) == Some(expected_method) {
+                    if let Some(filter) = signature_filter {
+                        let maybe_sig = value
+                            .get("params")
+                            .and_then(|p| p.get("result"))
+                            .and_then(|r| r.get("signature"))
+                            .and_then(|s| s.as_str());
+
+                        if maybe_sig != Some(filter) {
+                            if let Some(sig) = maybe_sig {
+                                let preview_len = sig.len().min(8);
+                                println!(
+                                    "⚠ {} ignored notification for signature {}",
+                                    source_name,
+                                    &sig[..preview_len]
+                                );
+                            } else {
+                                println!(
+                                    "⚠ {} ignored notification missing signature field",
+                                    source_name
+                                );
+                            }
+                            return false;
+                        }
+                    }
+
+                    let _ = tx.send((source_name.to_string(), received_micros)).await;
+                    let received_ms = (received_micros / 1_000) as u64;
+                    println!(
+                        "✓ {} notification received at {}",
+                        source_name,
+                        format_hms_millis(received_ms)
+                    );
+                    return true;
+                }
+            }
+            false
+        }
+        Ok(Message::Ping(p)) => {
+            let _ = ws.send(Message::Pong(p)).await;
+            false
+        }
+        Ok(Message::Close(_)) => true,
+        Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => false,
+        Err(e) => {
+            println!("⚠ {} WebSocket error: {}", source_name, e);
+            true
+        }
+        Ok(Message::Frame(_)) => false,
+    }
+}
+
+fn spawn_ws_listener(
+    mut ws: WsStream,
+    expected_method: &'static str,
+    source_name: &'static str,
+    signature_filter: Option<String>,
+    tx: tokio::sync::mpsc::Sender<(String, u128)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(msg) = ws.next().await {
+            let should_break = handle_ws_message(
+                msg,
+                expected_method,
+                source_name,
+                signature_filter.as_deref(),
+                &tx,
+                &mut ws,
+            )
+            .await;
+            if should_break {
+                break;
+            }
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
-    // Flip global switch for temporary diagnostic logging.
-    VERBOSE_LOGGING.store(args.verbose, Ordering::Relaxed);
-    if args.verbose {
-        println!("[DIAGNOSTIC] Verbose diagnostics enabled");
-    }
 
     // Load keypair
     println!("Loading keypair from {}...", args.keypair);
@@ -270,150 +354,141 @@ async fn main() -> Result<()> {
         .context("Failed to get latest blockhash")?;
 
     let lamports = (args.amount * LAMPORTS_PER_SOL as f64) as u64;
-    let tx: Transaction =
+    let transaction: Transaction =
         system_transaction::transfer(&keypair, &keypair.pubkey(), lamports, blockhash);
-    let signature = tx.signatures[0].to_string();
+    let signature = transaction.signatures[0].to_string();
 
     println!("\nTransaction signature: {}", signature);
     println!("Amount: {} SOL", args.amount);
 
-    // Subscribe to both WebSockets BEFORE sending transaction
+    if args.shred_ws.is_none() && args.local_ws.is_none() && args.helius_ws.is_none() {
+        anyhow::bail!(
+            "At least one WebSocket endpoint must be provided (--shred-ws, --local-ws, or --helius-ws)"
+        );
+    }
+
+    let has_shred = args.shred_ws.is_some();
+    let has_local = args.local_ws.is_some();
+    let has_helius = args.helius_ws.is_some();
+
+    let endpoint_count = [has_shred, has_local, has_helius]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
+    // Subscribe to requested WebSockets BEFORE sending the transaction
     println!("\n📡 Subscribing to WebSockets...");
     let wallet_str = keypair.pubkey().to_string();
-    let (mut local_ws, _local_sub_id) = subscribe_local_ws(&args.local_ws, &signature).await?;
-    let (mut helius_ws, _helius_sub_id) =
-        subscribe_helius_ws(&args.helius_ws, &signature, &wallet_str).await?;
+
+    let shred_ws_stream = if let Some(shred_url) = args.shred_ws.as_deref() {
+        let (stream, _shred_sub_id) = subscribe_shred_ws(shred_url, &signature).await?;
+        Some(stream)
+    } else {
+        None
+    };
+
+    let local_ws_stream = if let Some(local_url) = args.local_ws.as_deref() {
+        let (stream, _local_sub_id) = subscribe_solana_ws(local_url, &signature).await?;
+        Some(stream)
+    } else {
+        None
+    };
+
+    let helius_ws_stream = if let Some(helius_url) = args.helius_ws.as_deref() {
+        let (stream, _helius_sub_id) =
+            subscribe_helius_ws(helius_url, &signature, &wallet_str).await?;
+        Some(stream)
+    } else {
+        None
+    };
 
     println!("\n⏳ Preparing to listen for notifications...\n");
 
-    let (notif_tx, mut rx) = tokio::sync::mpsc::channel::<(String, u128)>(2);
-    let tx_local = notif_tx.clone();
-    let tx_helius = notif_tx.clone();
-    let expected_sig_helius = signature.clone();
-    let verbose = args.verbose;
-    let local_verbose = verbose;
-    let helius_verbose = verbose;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, u128)>(endpoint_count);
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    let local_task = tokio::spawn(async move {
-        while let Some(msg) = local_ws.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    let received_micros = now_micros();
+    if let Some(shred_ws) = shred_ws_stream {
+        let channel = tx.clone();
+        handles.push(spawn_ws_listener(
+            shred_ws,
+            "signatureNotification",
+            "Shred WS",
+            None,
+            channel,
+        ));
+    }
 
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if value.get("method").and_then(|m| m.as_str())
-                            == Some("signatureNotification")
-                        {
-                            let _ = tx_local.send(("LOCAL".to_string(), received_micros)).await;
-                            let received_ms = (received_micros / 1_000) as u64;
-                            println!(
-                                "✓ Local WS notification received at {}",
-                                format_hms_millis(received_ms)
-                            );
-                            break;
-                        }
-                    }
-                }
-                Ok(Message::Ping(p)) => {
-                    if local_verbose {
-                        println!(
-                            "[DIAGNOSTIC][local] Responding to ping at {} μs",
-                            current_micro_ts()
-                        );
-                    }
-                    let _ = local_ws.send(Message::Pong(p)).await;
-                }
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => continue,
-            }
-        }
-    });
+    if let Some(local_ws_stream) = local_ws_stream {
+        let channel = tx.clone();
+        handles.push(spawn_ws_listener(
+            local_ws_stream,
+            "signatureNotification",
+            "Local WS",
+            None,
+            channel,
+        ));
+    }
 
-    let helius_task = tokio::spawn(async move {
-        while let Some(msg) = helius_ws.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    let received_micros = now_micros();
-
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if value.get("method").and_then(|m| m.as_str())
-                            == Some("transactionNotification")
-                        {
-                            // IMPORTANT: Verify this is OUR transaction, not just any transaction for this wallet
-                            let sig = value
-                                .get("params")
-                                .and_then(|p| p.get("result"))
-                                .and_then(|r| r.get("signature"))
-                                .and_then(|s| s.as_str());
-
-                            if sig == Some(expected_sig_helius.as_str()) {
-                                let _ = tx_helius
-                                    .send(("HELIUS".to_string(), received_micros))
-                                    .await;
-                                let received_ms = (received_micros / 1_000) as u64;
-                                println!(
-                                    "✓ Helius WS notification received at {}",
-                                    format_hms_millis(received_ms)
-                                );
-                                break;
-                            } else {
-                                println!(
-                                    "⚠ Helius sent notification for different transaction: {:?}",
-                                    sig.map(|s| &s[..8])
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(Message::Ping(p)) => {
-                    if helius_verbose {
-                        println!(
-                            "[DIAGNOSTIC][helius] Responding to ping at {} μs",
-                            current_micro_ts()
-                        );
-                    }
-                    let _ = helius_ws.send(Message::Pong(p)).await;
-                }
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => continue,
-            }
-        }
-    });
+    if let Some(helius_ws) = helius_ws_stream {
+        let channel = tx.clone();
+        handles.push(spawn_ws_listener(
+            helius_ws,
+            "transactionNotification",
+            "Helius WS",
+            Some(signature.clone()),
+            channel,
+        ));
+    }
 
     // Send transaction
     println!("\n🚀 Sending transaction...");
-    let tx_sent_at = now_ms();
     let tx_sent_at_micros = now_micros();
     client
-        .send_and_confirm_transaction(&tx)
+        .send_and_confirm_transaction(&transaction)
         .context("Failed to send transaction")?;
-    println!("✓ Transaction sent at {}", format_human(tx_sent_at));
+    let tx_sent_at_ms = (tx_sent_at_micros / 1_000) as u64;
+    println!("✓ Transaction sent at {}", format_human(tx_sent_at_ms));
 
     // Wait for notifications from both sources
     println!("\n⏳ Waiting for notifications (max 60s)...\n");
 
-    // Wait for both tasks with timeout
-    let _ = tokio::time::timeout(Duration::from_secs(60), async {
-        tokio::join!(local_task, helius_task)
-    })
-    .await;
+    // Wait for WebSocket tasks with timeout
+    let wait_for_tasks = async move {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(60), wait_for_tasks).await;
 
-    drop(notif_tx);
+    drop(tx);
     let mut results = Vec::new();
     while let Some((source, micros)) = rx.recv().await {
         results.push((source, micros));
     }
     results.sort_by_key(|entry| entry.1);
 
+    let mut shred_micros: Option<u128> = None;
     let mut local_micros: Option<u128> = None;
     let mut helius_micros: Option<u128> = None;
 
     for (source, micros) in &results {
         match source.as_str() {
-            "LOCAL" => local_micros = Some(*micros),
-            "HELIUS" => helius_micros = Some(*micros),
+            "Shred WS" => shred_micros = Some(*micros),
+            "Local WS" => local_micros = Some(*micros),
+            "Helius WS" => helius_micros = Some(*micros),
             _ => {}
         }
+    }
+
+    let mut table_rows: Vec<(&str, Option<u128>)> = Vec::new();
+    if has_shred {
+        table_rows.push(("Shred WS", shred_micros));
+    }
+    if has_local {
+        table_rows.push(("Local WS", local_micros));
+    }
+    if has_helius {
+        table_rows.push(("Helius WS", helius_micros));
     }
 
     // Print comparison table
@@ -421,67 +496,59 @@ async fn main() -> Result<()> {
     println!("│ Source           │ Notification Time               │ Latency (ms) │");
     println!("├──────────────────┼─────────────────────────────────┼──────────────┤");
 
-    match local_micros {
-        Some(local_value) => {
-            let local_ms = (local_value / 1_000) as u64;
-            let latency_micros = local_value.saturating_sub(tx_sent_at_micros);
-            println!(
-                "│ {:<16} │ {:<31} │ {:>12} │",
-                "Local WS",
-                format_human(local_ms),
-                format_latency(latency_micros)
-            );
-        }
-        None => {
-            println!("│ {:<16} │ {:^31} │ {:^12} │", "Local WS", "TIMEOUT", "N/A");
-        }
-    }
-
-    match helius_micros {
-        Some(helius_value) => {
-            let helius_ms = (helius_value / 1_000) as u64;
-            let latency_micros = helius_value.saturating_sub(tx_sent_at_micros);
-            println!(
-                "│ {:<16} │ {:<31} │ {:>12} │",
-                "Helius WS",
-                format_human(helius_ms),
-                format_latency(latency_micros)
-            );
-        }
-        None => {
-            println!(
-                "│ {:<16} │ {:^31} │ {:^12} │",
-                "Helius WS", "TIMEOUT", "N/A"
-            );
+    for (label, maybe_micros) in &table_rows {
+        match maybe_micros {
+            Some(value) => {
+                let ts_ms = (value / 1_000) as u64;
+                let latency_micros = value.saturating_sub(tx_sent_at_micros);
+                println!(
+                    "│ {:<16} │ {:<31} │ {:>12} │",
+                    label,
+                    format_human(ts_ms),
+                    format_latency(latency_micros)
+                );
+            }
+            None => {
+                println!("│ {:<16} │ {:^31} │ {:^12} │", label, "TIMEOUT", "N/A");
+            }
         }
     }
 
     println!("└──────────────────┴─────────────────────────────────┴──────────────┘");
 
-    // Determine winner
-    match (local_micros, helius_micros) {
-        (Some(local), Some(helius)) => {
-            let (diff_micros, helius_faster) = if local <= helius {
-                (helius.saturating_sub(local), false)
-            } else {
-                (local.saturating_sub(helius), true)
-            };
+    let mut arrival_times: Vec<(&str, u128)> = table_rows
+        .iter()
+        .filter_map(|(label, maybe)| maybe.map(|value| (*label, value)))
+        .collect();
+    arrival_times.sort_by_key(|(_, micros)| *micros);
 
-            let diff_string = format_latency(diff_micros);
+    if arrival_times.is_empty() {
+        println!("\n❌ All sources timed out");
+    } else {
+        let (winner_label, winner_micros) = arrival_times[0];
+        let winner_latency = winner_micros.saturating_sub(tx_sent_at_micros);
+        println!(
+            "\n🏆 Winner: {} ({} latency)",
+            winner_label,
+            format_latency(winner_latency)
+        );
 
-            println!("\nDifference: {}", diff_string);
-
-            if diff_micros == 0 {
-                println!("\n🤝 Tie: Both notified at the same time");
-            } else if helius_faster {
-                println!("\n🏆 Winner: Helius WS ({} faster)", diff_string);
-            } else {
-                println!("\n🏆 Winner: Local WS ({} faster)", diff_string);
+        println!("\nDifferences vs winner:");
+        for (label, maybe) in &table_rows {
+            match maybe {
+                Some(value) => {
+                    let diff = value.saturating_sub(winner_micros);
+                    if diff == 0 {
+                        println!("• {}: tie", label);
+                    } else {
+                        println!("• {}: +{}", label, format_latency(diff));
+                    }
+                }
+                None => {
+                    println!("• {}: TIMEOUT", label);
+                }
             }
         }
-        (Some(_), None) => println!("\n🏆 Winner: Local WS (Helius timed out)"),
-        (None, Some(_)) => println!("\n🏆 Winner: Helius WS (Local timed out)"),
-        (None, None) => println!("\n❌ Both sources timed out"),
     }
 
     Ok(())
