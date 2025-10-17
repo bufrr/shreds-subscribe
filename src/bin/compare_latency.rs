@@ -157,8 +157,7 @@ fn build_transfer_transaction(
     let blockhash: Hash = client
         .get_latest_blockhash()
         .context("Failed to get latest blockhash")?;
-    let transaction =
-        system_transaction::transfer(keypair, &keypair.pubkey(), lamports, blockhash);
+    let transaction = system_transaction::transfer(keypair, &keypair.pubkey(), lamports, blockhash);
     let signature = transaction.signatures[0].to_string();
     Ok((transaction, signature))
 }
@@ -581,8 +580,11 @@ async fn main() -> Result<()> {
     }
 
     if args.test_amount == 1 {
-        println!("
-Transaction signature: {}", initial_signature);
+        println!(
+            "
+Transaction signature: {}",
+            initial_signature
+        );
         println!("Amount: {} SOL", args.amount);
     }
 
@@ -622,8 +624,10 @@ Transaction signature: {}", initial_signature);
         );
     }
 
-    println!("
-📡 Subscribing to WebSockets...");
+    println!(
+        "
+📡 Subscribing to WebSockets..."
+    );
     let wallet_str = keypair.pubkey().to_string();
 
     let (tx, mut rx) =
@@ -641,7 +645,7 @@ Transaction signature: {}", initial_signature);
             stream,
             "signatureNotification",
             "Shred WS",
-            Some(initial_signature.clone()),
+            None, // signatureNotification doesn't include signature in response
             tx.clone(),
         );
         _handles.push(handle);
@@ -654,7 +658,7 @@ Transaction signature: {}", initial_signature);
             stream,
             "signatureNotification",
             "Local WS",
-            Some(initial_signature.clone()),
+            None, // signatureNotification doesn't include signature in response
             tx.clone(),
         );
         _handles.push(handle);
@@ -690,17 +694,22 @@ Transaction signature: {}", initial_signature);
         helius_cmd = Some(cmd_sender);
     }
 
-    println!("
+    println!(
+        "
 ⏳ Preparing to listen for notifications...
-");
+"
+    );
 
     let mut pending_transaction = Some(initial_transaction);
     let mut pending_signature = Some(initial_signature);
 
     for test_num in 1..=args.test_amount {
         if args.test_amount > 1 {
-            println!("
-{}", "=".repeat(60));
+            println!(
+                "
+{}",
+                "=".repeat(60)
+            );
             println!("Test {}/{}", test_num, args.test_amount);
             println!("{}", "=".repeat(60));
         }
@@ -713,13 +722,18 @@ Transaction signature: {}", initial_signature);
             .context("Missing prepared signature for test run")?;
 
         if args.test_amount > 1 || test_num > 1 {
-            println!("
-Transaction signature: {}", signature);
+            println!(
+                "
+Transaction signature: {}",
+                signature
+            );
             println!("Amount: {} SOL", args.amount);
         }
 
-        println!("
-🚀 Sending transaction...");
+        println!(
+            "
+🚀 Sending transaction..."
+        );
         let tx_sent_at_micros = now_micros();
         client
             .send_and_confirm_transaction(&transaction)
@@ -727,9 +741,11 @@ Transaction signature: {}", signature);
         let tx_sent_at_ms = (tx_sent_at_micros / 1_000) as u64;
         println!("✓ Transaction sent at {}", format_human(tx_sent_at_ms));
 
-        println!("
+        println!(
+            "
 ⏳ Waiting for notifications (max 5s)...
-");
+"
+        );
 
         let mut results_map: HashMap<String, u128> = HashMap::new();
         let mut results_ordered: Vec<(String, u128)> = Vec::new();
@@ -777,8 +793,10 @@ Transaction signature: {}", signature);
             table_rows.push(("Helius WS", results_map.get("Helius WS").copied()));
         }
 
-        println!("
-┌──────────────────────┬─────────────────────────────────┬──────────────┐");
+        println!(
+            "
+┌──────────────────────┬─────────────────────────────────┬──────────────┐"
+        );
         println!("│ Source               │ Notification Time               │ Latency (ms) │");
         println!("├──────────────────────┼─────────────────────────────────┼──────────────┤");
 
@@ -809,8 +827,10 @@ Transaction signature: {}", signature);
         arrival_times.sort_by_key(|(_, micros)| *micros);
 
         if arrival_times.is_empty() {
-            println!("
-❌ All sources timed out");
+            println!(
+                "
+❌ All sources timed out"
+            );
         } else {
             let (winner_label, winner_micros) = arrival_times[0];
             let winner_latency = winner_micros.saturating_sub(tx_sent_at_micros);
@@ -821,8 +841,10 @@ Transaction signature: {}", signature);
                 format_latency(winner_latency)
             );
 
-            println!("
-Differences vs winner:");
+            println!(
+                "
+Differences vs winner:"
+            );
             for (label, maybe) in &table_rows {
                 match maybe {
                     Some(value) => {
@@ -897,12 +919,12 @@ Differences vs winner:");
     }
 
     if args.test_amount > 1 {
-        println!("
-{}", "=".repeat(80));
         println!(
-            "PERFORMANCE ANALYSIS ({} tests)",
-            args.test_amount
+            "
+{}",
+            "=".repeat(80)
         );
+        println!("PERFORMANCE ANALYSIS ({} tests)", args.test_amount);
         println!("{}", "=".repeat(80));
         println!();
         println!("┌──────────────────────┬────────────┬────────────┬────────────┬──────────────┐");
