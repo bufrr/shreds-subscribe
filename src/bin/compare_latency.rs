@@ -43,6 +43,12 @@ struct Args {
     )]
     local_ws: Option<String>,
 
+    #[arg(
+        long,
+        help = "Local Enhanced WebSocket URL (e.g., ws://127.0.0.1:8901)"
+    )]
+    local_enhanced_ws: Option<String>,
+
     #[arg(long, help = "Helius WebSocket URL (including ?api-key=YOUR_KEY)")]
     helius_ws: Option<String>,
 
@@ -166,6 +172,75 @@ async fn subscribe_solana_ws(ws_url: &str, signature: &str) -> Result<(WsStream,
     Ok((ws, sub_id))
 }
 
+async fn subscribe_local_enhanced_ws(
+    ws_url: &str,
+    _signature: &str,
+    wallet_pubkey: &str,
+) -> Result<(WsStream, u64)> {
+    let (mut ws, _) = connect_async(ws_url)
+        .await
+        .context("Failed to connect to Local Enhanced WebSocket")?;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "transactionSubscribe",
+        "params": [
+            {
+                "failed": false,
+                "accounts": {
+                    "include": [wallet_pubkey]
+                }
+            },
+            {
+                "commitment": "processed",
+                "encoding": "jsonParsed",
+                "transactionDetails": "full",
+                "maxSupportedTransactionVersion": 0
+            }
+        ]
+    });
+
+    ws.send(Message::Text(request.to_string().into()))
+        .await
+        .context("Failed to send transactionSubscribe")?;
+
+    let response_text = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => break Ok(text),
+                Some(Ok(Message::Ping(p))) => {
+                    ws.send(Message::Pong(p)).await?;
+                }
+                Some(Ok(Message::Close(_))) => anyhow::bail!("WebSocket closed"),
+                Some(Err(e)) => return Err(e.into()),
+                None => anyhow::bail!("WebSocket closed"),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .context("Timeout waiting for subscription response")??;
+
+    let value: serde_json::Value =
+        serde_json::from_str(&response_text).context("Failed to parse subscription response")?;
+
+    if let Some(error) = value.get("error") {
+        anyhow::bail!("Local Enhanced subscription error: {}", error);
+    }
+
+    let sub_id = value
+        .get("result")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .with_context(|| format!("Missing subscription ID. Response: {}", response_text))?;
+
+    println!("✓ Local Enhanced WS subscribed (ID: {})", sub_id);
+    Ok((ws, sub_id))
+}
+
 async fn subscribe_helius_ws(
     ws_url: &str,
     _signature: &str,
@@ -254,7 +329,18 @@ async fn handle_ws_message(
                             .get("params")
                             .and_then(|p| p.get("result"))
                             .and_then(|r| r.get("signature"))
-                            .and_then(|s| s.as_str());
+                            .and_then(|s| s.as_str())
+                            .or_else(|| {
+                                value
+                                    .get("params")
+                                    .and_then(|p| p.get("result"))
+                                    .and_then(|r| r.get("value"))
+                                    .and_then(|v| v.get("transaction"))
+                                    .and_then(|t| t.get("transaction"))
+                                    .and_then(|t| t.get("signatures"))
+                                    .and_then(|s| s.get(0))
+                                    .and_then(|s| s.as_str())
+                            });
 
                         if maybe_sig != Some(filter) {
                             if let Some(sig) = maybe_sig {
@@ -361,17 +447,22 @@ async fn main() -> Result<()> {
     println!("\nTransaction signature: {}", signature);
     println!("Amount: {} SOL", args.amount);
 
-    if args.shred_ws.is_none() && args.local_ws.is_none() && args.helius_ws.is_none() {
+    if args.shred_ws.is_none()
+        && args.local_ws.is_none()
+        && args.local_enhanced_ws.is_none()
+        && args.helius_ws.is_none()
+    {
         anyhow::bail!(
-            "At least one WebSocket endpoint must be provided (--shred-ws, --local-ws, or --helius-ws)"
+            "At least one WebSocket endpoint must be provided (--shred-ws, --local-ws, --local-enhanced-ws, or --helius-ws)"
         );
     }
 
     let has_shred = args.shred_ws.is_some();
     let has_local = args.local_ws.is_some();
+    let has_local_enhanced = args.local_enhanced_ws.is_some();
     let has_helius = args.helius_ws.is_some();
 
-    let endpoint_count = [has_shred, has_local, has_helius]
+    let endpoint_count = [has_shred, has_local, has_local_enhanced, has_helius]
         .iter()
         .filter(|&&x| x)
         .count();
@@ -393,6 +484,15 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    let local_enhanced_ws_stream =
+        if let Some(local_enhanced_url) = args.local_enhanced_ws.as_deref() {
+            let (stream, _local_enhanced_sub_id) =
+                subscribe_local_enhanced_ws(local_enhanced_url, &signature, &wallet_str).await?;
+            Some(stream)
+        } else {
+            None
+        };
 
     let helius_ws_stream = if let Some(helius_url) = args.helius_ws.as_deref() {
         let (stream, _helius_sub_id) =
@@ -425,6 +525,17 @@ async fn main() -> Result<()> {
             "signatureNotification",
             "Local WS",
             None,
+            channel,
+        ));
+    }
+
+    if let Some(local_enhanced_ws) = local_enhanced_ws_stream {
+        let channel = tx.clone();
+        handles.push(spawn_ws_listener(
+            local_enhanced_ws,
+            "transactionNotification",
+            "Local Enhanced WS",
+            Some(signature.clone()),
             channel,
         ));
     }
@@ -469,12 +580,14 @@ async fn main() -> Result<()> {
 
     let mut shred_micros: Option<u128> = None;
     let mut local_micros: Option<u128> = None;
+    let mut local_enhanced_micros: Option<u128> = None;
     let mut helius_micros: Option<u128> = None;
 
     for (source, micros) in &results {
         match source.as_str() {
             "Shred WS" => shred_micros = Some(*micros),
             "Local WS" => local_micros = Some(*micros),
+            "Local Enhanced WS" => local_enhanced_micros = Some(*micros),
             "Helius WS" => helius_micros = Some(*micros),
             _ => {}
         }
@@ -486,6 +599,9 @@ async fn main() -> Result<()> {
     }
     if has_local {
         table_rows.push(("Local WS", local_micros));
+    }
+    if has_local_enhanced {
+        table_rows.push(("Local Enhanced WS", local_enhanced_micros));
     }
     if has_helius {
         table_rows.push(("Helius WS", helius_micros));
