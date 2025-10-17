@@ -9,6 +9,7 @@ use solana_sdk::native_token::LAMPORTS_PER_SOL;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 use solana_system_transaction as system_transaction;
+use std::collections::HashMap;
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::connect_async;
@@ -54,6 +55,13 @@ struct Args {
 
     #[arg(long, default_value = "0.01", help = "Amount to transfer in SOL")]
     amount: f64,
+
+    #[arg(
+        long,
+        default_value = "1",
+        help = "Number of test transactions to send"
+    )]
+    test_amount: usize,
 }
 
 fn now_micros() -> u128 {
@@ -82,6 +90,77 @@ fn format_hms_millis(ts_ms: u64) -> String {
 fn format_latency(latency_micros: u128) -> String {
     let latency_ms = latency_micros as f64 / 1_000.0;
     format!("{:.3} ms", latency_ms)
+}
+
+#[derive(Debug)]
+struct EndpointStats {
+    name: String,
+    latencies: Vec<u128>,
+    timeouts: usize,
+}
+
+impl EndpointStats {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            latencies: Vec::new(),
+            timeouts: 0,
+        }
+    }
+
+    fn avg_latency_ms(&self) -> f64 {
+        if self.latencies.is_empty() {
+            return 0.0;
+        }
+        let sum: u128 = self.latencies.iter().sum();
+        (sum as f64 / self.latencies.len() as f64) / 1_000.0
+    }
+
+    fn min_latency_ms(&self) -> f64 {
+        self.latencies
+            .iter()
+            .min()
+            .map(|&v| v as f64 / 1_000.0)
+            .unwrap_or(0.0)
+    }
+
+    fn max_latency_ms(&self) -> f64 {
+        self.latencies
+            .iter()
+            .max()
+            .map(|&v| v as f64 / 1_000.0)
+            .unwrap_or(0.0)
+    }
+
+    fn success_rate(&self, total_tests: usize) -> f64 {
+        if total_tests == 0 {
+            return 0.0;
+        }
+        (self.latencies.len() as f64 / total_tests as f64) * 100.0
+    }
+}
+
+enum ListenerKind {
+    Signature,
+    Account,
+}
+
+enum ListenerCommand {
+    UpdateSignature(String),
+}
+
+fn build_transfer_transaction(
+    client: &RpcClient,
+    keypair: &Keypair,
+    lamports: u64,
+) -> Result<(Transaction, String)> {
+    let blockhash: Hash = client
+        .get_latest_blockhash()
+        .context("Failed to get latest blockhash")?;
+    let transaction =
+        system_transaction::transfer(keypair, &keypair.pubkey(), lamports, blockhash);
+    let signature = transaction.signatures[0].to_string();
+    Ok((transaction, signature))
 }
 
 async fn subscribe_shred_ws(ws_url: &str, signature: &str) -> Result<(WsStream, u64)> {
@@ -387,42 +466,94 @@ async fn handle_ws_message(
 }
 
 fn spawn_ws_listener(
-    mut ws: WsStream,
+    ws: WsStream,
     expected_method: &'static str,
     source_name: &'static str,
-    signature_filter: Option<String>,
+    initial_signature: Option<String>,
     tx: tokio::sync::mpsc::Sender<(String, u128)>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(msg) = ws.next().await {
-            let should_break = handle_ws_message(
-                msg,
-                expected_method,
-                source_name,
-                signature_filter.as_deref(),
-                &tx,
-                &mut ws,
-            )
-            .await;
-            if should_break {
-                break;
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedSender<ListenerCommand>,
+) {
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ListenerCommand>();
+    let mut ws = ws;
+    let mut current_signature = initial_signature;
+    let kind = match expected_method {
+        "signatureNotification" => ListenerKind::Signature,
+        _ => ListenerKind::Account,
+    };
+
+    let handle = tokio::spawn(async move {
+        let mut request_id: u64 = 2;
+        loop {
+            tokio::select! {
+                Some(cmd) = cmd_rx.recv() => {
+                    if let ListenerCommand::UpdateSignature(sig) = cmd {
+                        if matches!(kind, ListenerKind::Signature) {
+                            let request = json!({
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "method": "signatureSubscribe",
+                                "params": [sig.clone(), {"commitment": "processed"}],
+                            });
+                            request_id = request_id.saturating_add(1);
+                            if let Err(e) = ws.send(Message::Text(request.to_string().into())).await {
+                                println!("⚠ {} failed to send signatureSubscribe: {}", source_name, e);
+                            } else {
+                                let preview_len = sig.len().min(8);
+                                if preview_len > 0 {
+                                    println!(
+                                        "↺ {} subscribed to {}…",
+                                        source_name,
+                                        &sig[..preview_len]
+                                    );
+                                } else {
+                                    println!("↺ {} subscribed to new signature", source_name);
+                                }
+                            }
+                        }
+                        current_signature = Some(sig);
+                    }
+                }
+                msg = ws.next() => {
+                    match msg {
+                        Some(msg) => {
+                            let should_break = handle_ws_message(
+                                msg,
+                                expected_method,
+                                source_name,
+                                current_signature.as_deref(),
+                                &tx,
+                                &mut ws,
+                            ).await;
+                            if should_break {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
             }
         }
-    })
+    });
+
+    (handle, cmd_tx)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Load keypair
+    if args.test_amount == 0 {
+        anyhow::bail!("--test-amount must be at least 1");
+    }
+
     println!("Loading keypair from {}...", args.keypair);
     let keypair_data = fs::read_to_string(&args.keypair)
         .with_context(|| format!("Failed to read keypair file: {}", args.keypair))?;
     let keypair_bytes: Vec<u8> = serde_json::from_str(&keypair_data)
         .context("Failed to parse keypair JSON (expected array of 64 bytes)")?;
 
-    // Extract the first 32 bytes as the secret key
     if keypair_bytes.len() < 32 {
         anyhow::bail!("Keypair file must contain at least 32 bytes");
     }
@@ -432,20 +563,12 @@ async fn main() -> Result<()> {
 
     println!("Wallet: {}", keypair.pubkey());
 
-    // Build transaction
     let client =
         RpcClient::new_with_commitment(args.rpc_url.clone(), CommitmentConfig::confirmed());
-    let blockhash: Hash = client
-        .get_latest_blockhash()
-        .context("Failed to get latest blockhash")?;
-
     let lamports = (args.amount * LAMPORTS_PER_SOL as f64) as u64;
-    let transaction: Transaction =
-        system_transaction::transfer(&keypair, &keypair.pubkey(), lamports, blockhash);
-    let signature = transaction.signatures[0].to_string();
 
-    println!("\nTransaction signature: {}", signature);
-    println!("Amount: {} SOL", args.amount);
+    let (initial_transaction, initial_signature) =
+        build_transfer_transaction(&client, &keypair, lamports)?;
 
     if args.shred_ws.is_none()
         && args.local_ws.is_none()
@@ -455,6 +578,12 @@ async fn main() -> Result<()> {
         anyhow::bail!(
             "At least one WebSocket endpoint must be provided (--shred-ws, --local-ws, --local-enhanced-ws, or --helius-ws)"
         );
+    }
+
+    if args.test_amount == 1 {
+        println!("
+Transaction signature: {}", initial_signature);
+        println!("Amount: {} SOL", args.amount);
     }
 
     let has_shred = args.shred_ws.is_some();
@@ -467,204 +596,333 @@ async fn main() -> Result<()> {
         .filter(|&&x| x)
         .count();
 
-    // Subscribe to requested WebSockets BEFORE sending the transaction
-    println!("\n📡 Subscribing to WebSockets...");
-    let wallet_str = keypair.pubkey().to_string();
-
-    let shred_ws_stream = if let Some(shred_url) = args.shred_ws.as_deref() {
-        let (stream, _shred_sub_id) = subscribe_shred_ws(shred_url, &signature).await?;
-        Some(stream)
-    } else {
-        None
-    };
-
-    let local_ws_stream = if let Some(local_url) = args.local_ws.as_deref() {
-        let (stream, _local_sub_id) = subscribe_solana_ws(local_url, &signature).await?;
-        Some(stream)
-    } else {
-        None
-    };
-
-    let local_enhanced_ws_stream =
-        if let Some(local_enhanced_url) = args.local_enhanced_ws.as_deref() {
-            let (stream, _local_enhanced_sub_id) =
-                subscribe_local_enhanced_ws(local_enhanced_url, &signature, &wallet_str).await?;
-            Some(stream)
-        } else {
-            None
-        };
-
-    let helius_ws_stream = if let Some(helius_url) = args.helius_ws.as_deref() {
-        let (stream, _helius_sub_id) =
-            subscribe_helius_ws(helius_url, &signature, &wallet_str).await?;
-        Some(stream)
-    } else {
-        None
-    };
-
-    println!("\n⏳ Preparing to listen for notifications...\n");
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, u128)>(endpoint_count);
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-
-    if let Some(shred_ws) = shred_ws_stream {
-        let channel = tx.clone();
-        handles.push(spawn_ws_listener(
-            shred_ws,
-            "signatureNotification",
-            "Shred WS",
-            None,
-            channel,
-        ));
-    }
-
-    if let Some(local_ws_stream) = local_ws_stream {
-        let channel = tx.clone();
-        handles.push(spawn_ws_listener(
-            local_ws_stream,
-            "signatureNotification",
-            "Local WS",
-            None,
-            channel,
-        ));
-    }
-
-    if let Some(local_enhanced_ws) = local_enhanced_ws_stream {
-        let channel = tx.clone();
-        handles.push(spawn_ws_listener(
-            local_enhanced_ws,
-            "transactionNotification",
-            "Local Enhanced WS",
-            Some(signature.clone()),
-            channel,
-        ));
-    }
-
-    if let Some(helius_ws) = helius_ws_stream {
-        let channel = tx.clone();
-        handles.push(spawn_ws_listener(
-            helius_ws,
-            "transactionNotification",
-            "Helius WS",
-            Some(signature.clone()),
-            channel,
-        ));
-    }
-
-    // Send transaction
-    println!("\n🚀 Sending transaction...");
-    let tx_sent_at_micros = now_micros();
-    client
-        .send_and_confirm_transaction(&transaction)
-        .context("Failed to send transaction")?;
-    let tx_sent_at_ms = (tx_sent_at_micros / 1_000) as u64;
-    println!("✓ Transaction sent at {}", format_human(tx_sent_at_ms));
-
-    // Wait for notifications from both sources
-    println!("\n⏳ Waiting for notifications (max 60s)...\n");
-
-    // Wait for WebSocket tasks with timeout
-    let wait_for_tasks = async move {
-        for handle in handles {
-            let _ = handle.await;
-        }
-    };
-    let _ = tokio::time::timeout(Duration::from_secs(60), wait_for_tasks).await;
-
-    drop(tx);
-    let mut results = Vec::new();
-    while let Some((source, micros)) = rx.recv().await {
-        results.push((source, micros));
-    }
-    results.sort_by_key(|entry| entry.1);
-
-    let mut shred_micros: Option<u128> = None;
-    let mut local_micros: Option<u128> = None;
-    let mut local_enhanced_micros: Option<u128> = None;
-    let mut helius_micros: Option<u128> = None;
-
-    for (source, micros) in &results {
-        match source.as_str() {
-            "Shred WS" => shred_micros = Some(*micros),
-            "Local WS" => local_micros = Some(*micros),
-            "Local Enhanced WS" => local_enhanced_micros = Some(*micros),
-            "Helius WS" => helius_micros = Some(*micros),
-            _ => {}
-        }
-    }
-
-    let mut table_rows: Vec<(&str, Option<u128>)> = Vec::new();
+    let mut stats_map: HashMap<String, EndpointStats> = HashMap::new();
     if has_shred {
-        table_rows.push(("Shred WS", shred_micros));
+        stats_map.insert(
+            "Shred WS".to_string(),
+            EndpointStats::new("Shred WS".to_string()),
+        );
     }
     if has_local {
-        table_rows.push(("Local WS", local_micros));
+        stats_map.insert(
+            "Local WS".to_string(),
+            EndpointStats::new("Local WS".to_string()),
+        );
     }
     if has_local_enhanced {
-        table_rows.push(("Local Enhanced WS", local_enhanced_micros));
+        stats_map.insert(
+            "Local Enhanced WS".to_string(),
+            EndpointStats::new("Local Enhanced WS".to_string()),
+        );
     }
     if has_helius {
-        table_rows.push(("Helius WS", helius_micros));
-    }
-
-    // Print comparison table
-    println!("\n┌──────────────────┬─────────────────────────────────┬──────────────┐");
-    println!("│ Source           │ Notification Time               │ Latency (ms) │");
-    println!("├──────────────────┼─────────────────────────────────┼──────────────┤");
-
-    for (label, maybe_micros) in &table_rows {
-        match maybe_micros {
-            Some(value) => {
-                let ts_ms = (value / 1_000) as u64;
-                let latency_micros = value.saturating_sub(tx_sent_at_micros);
-                println!(
-                    "│ {:<16} │ {:<31} │ {:>12} │",
-                    label,
-                    format_human(ts_ms),
-                    format_latency(latency_micros)
-                );
-            }
-            None => {
-                println!("│ {:<16} │ {:^31} │ {:^12} │", label, "TIMEOUT", "N/A");
-            }
-        }
-    }
-
-    println!("└──────────────────┴─────────────────────────────────┴──────────────┘");
-
-    let mut arrival_times: Vec<(&str, u128)> = table_rows
-        .iter()
-        .filter_map(|(label, maybe)| maybe.map(|value| (*label, value)))
-        .collect();
-    arrival_times.sort_by_key(|(_, micros)| *micros);
-
-    if arrival_times.is_empty() {
-        println!("\n❌ All sources timed out");
-    } else {
-        let (winner_label, winner_micros) = arrival_times[0];
-        let winner_latency = winner_micros.saturating_sub(tx_sent_at_micros);
-        println!(
-            "\n🏆 Winner: {} ({} latency)",
-            winner_label,
-            format_latency(winner_latency)
+        stats_map.insert(
+            "Helius WS".to_string(),
+            EndpointStats::new("Helius WS".to_string()),
         );
+    }
 
-        println!("\nDifferences vs winner:");
-        for (label, maybe) in &table_rows {
-            match maybe {
-                Some(value) => {
-                    let diff = value.saturating_sub(winner_micros);
-                    if diff == 0 {
-                        println!("• {}: tie", label);
-                    } else {
-                        println!("• {}: +{}", label, format_latency(diff));
+    println!("
+📡 Subscribing to WebSockets...");
+    let wallet_str = keypair.pubkey().to_string();
+
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<(String, u128)>(std::cmp::max(1, endpoint_count));
+
+    let mut _handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut shred_cmd = None;
+    let mut local_cmd = None;
+    let mut local_enhanced_cmd = None;
+    let mut helius_cmd = None;
+
+    if let Some(shred_url) = args.shred_ws.as_deref() {
+        let (stream, _shred_sub_id) = subscribe_shred_ws(shred_url, &initial_signature).await?;
+        let (handle, cmd_sender) = spawn_ws_listener(
+            stream,
+            "signatureNotification",
+            "Shred WS",
+            Some(initial_signature.clone()),
+            tx.clone(),
+        );
+        _handles.push(handle);
+        shred_cmd = Some(cmd_sender);
+    }
+
+    if let Some(local_url) = args.local_ws.as_deref() {
+        let (stream, _local_sub_id) = subscribe_solana_ws(local_url, &initial_signature).await?;
+        let (handle, cmd_sender) = spawn_ws_listener(
+            stream,
+            "signatureNotification",
+            "Local WS",
+            Some(initial_signature.clone()),
+            tx.clone(),
+        );
+        _handles.push(handle);
+        local_cmd = Some(cmd_sender);
+    }
+
+    if let Some(local_enhanced_url) = args.local_enhanced_ws.as_deref() {
+        let (stream, _local_enhanced_sub_id) =
+            subscribe_local_enhanced_ws(local_enhanced_url, &initial_signature, &wallet_str)
+                .await?;
+        let (handle, cmd_sender) = spawn_ws_listener(
+            stream,
+            "transactionNotification",
+            "Local Enhanced WS",
+            Some(initial_signature.clone()),
+            tx.clone(),
+        );
+        _handles.push(handle);
+        local_enhanced_cmd = Some(cmd_sender);
+    }
+
+    if let Some(helius_url) = args.helius_ws.as_deref() {
+        let (stream, _helius_sub_id) =
+            subscribe_helius_ws(helius_url, &initial_signature, &wallet_str).await?;
+        let (handle, cmd_sender) = spawn_ws_listener(
+            stream,
+            "transactionNotification",
+            "Helius WS",
+            Some(initial_signature.clone()),
+            tx.clone(),
+        );
+        _handles.push(handle);
+        helius_cmd = Some(cmd_sender);
+    }
+
+    println!("
+⏳ Preparing to listen for notifications...
+");
+
+    let mut pending_transaction = Some(initial_transaction);
+    let mut pending_signature = Some(initial_signature);
+
+    for test_num in 1..=args.test_amount {
+        if args.test_amount > 1 {
+            println!("
+{}", "=".repeat(60));
+            println!("Test {}/{}", test_num, args.test_amount);
+            println!("{}", "=".repeat(60));
+        }
+
+        let transaction = pending_transaction
+            .take()
+            .context("Missing prepared transaction for test run")?;
+        let signature = pending_signature
+            .take()
+            .context("Missing prepared signature for test run")?;
+
+        if args.test_amount > 1 || test_num > 1 {
+            println!("
+Transaction signature: {}", signature);
+            println!("Amount: {} SOL", args.amount);
+        }
+
+        println!("
+🚀 Sending transaction...");
+        let tx_sent_at_micros = now_micros();
+        client
+            .send_and_confirm_transaction(&transaction)
+            .context("Failed to send transaction")?;
+        let tx_sent_at_ms = (tx_sent_at_micros / 1_000) as u64;
+        println!("✓ Transaction sent at {}", format_human(tx_sent_at_ms));
+
+        println!("
+⏳ Waiting for notifications (max 5s)...
+");
+
+        let mut results_map: HashMap<String, u128> = HashMap::new();
+        let mut results_ordered: Vec<(String, u128)> = Vec::new();
+        let mut timeout = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                _ = &mut timeout => {
+                    break;
+                }
+                maybe_msg = rx.recv() => {
+                    match maybe_msg {
+                        Some((source, micros)) => {
+                            if !results_map.contains_key(&source) {
+                                results_map.insert(source.clone(), micros);
+                                results_ordered.push((source.clone(), micros));
+                                if results_map.len() >= endpoint_count {
+                                    break;
+                                }
+                            }
+                        }
+                        None => break,
                     }
                 }
+            }
+        }
+
+        results_ordered.sort_by_key(|(_, micros)| *micros);
+
+        let mut table_rows: Vec<(&str, Option<u128>)> = Vec::new();
+        if has_shred {
+            table_rows.push(("Shred WS", results_map.get("Shred WS").copied()));
+        }
+        if has_local {
+            table_rows.push(("Local WS", results_map.get("Local WS").copied()));
+        }
+        if has_local_enhanced {
+            table_rows.push((
+                "Local Enhanced WS",
+                results_map.get("Local Enhanced WS").copied(),
+            ));
+        }
+        if has_helius {
+            table_rows.push(("Helius WS", results_map.get("Helius WS").copied()));
+        }
+
+        println!("
+┌──────────────────────┬─────────────────────────────────┬──────────────┐");
+        println!("│ Source               │ Notification Time               │ Latency (ms) │");
+        println!("├──────────────────────┼─────────────────────────────────┼──────────────┤");
+
+        for (label, maybe_micros) in &table_rows {
+            match maybe_micros {
+                Some(value) => {
+                    let ts_ms = (value / 1_000) as u64;
+                    let latency_micros = value.saturating_sub(tx_sent_at_micros);
+                    println!(
+                        "│ {:<20} │ {:<31} │ {:>12} │",
+                        label,
+                        format_human(ts_ms),
+                        format_latency(latency_micros)
+                    );
+                }
                 None => {
-                    println!("• {}: TIMEOUT", label);
+                    println!("│ {:<20} │ {:^31} │ {:^12} │", label, "TIMEOUT", "N/A");
                 }
             }
         }
+
+        println!("└──────────────────────┴─────────────────────────────────┴──────────────┘");
+
+        let mut arrival_times: Vec<(&str, u128)> = table_rows
+            .iter()
+            .filter_map(|(label, maybe)| maybe.map(|value| (*label, value)))
+            .collect();
+        arrival_times.sort_by_key(|(_, micros)| *micros);
+
+        if arrival_times.is_empty() {
+            println!("
+❌ All sources timed out");
+        } else {
+            let (winner_label, winner_micros) = arrival_times[0];
+            let winner_latency = winner_micros.saturating_sub(tx_sent_at_micros);
+            println!(
+                "
+🏆 Winner: {} ({} latency)",
+                winner_label,
+                format_latency(winner_latency)
+            );
+
+            println!("
+Differences vs winner:");
+            for (label, maybe) in &table_rows {
+                match maybe {
+                    Some(value) => {
+                        let diff = value.saturating_sub(winner_micros);
+                        if diff == 0 {
+                            println!("• {}: tie", label);
+                        } else {
+                            println!("• {}: +{}", label, format_latency(diff));
+                        }
+                    }
+                    None => {
+                        println!("• {}: TIMEOUT", label);
+                    }
+                }
+            }
+        }
+
+        for stats in stats_map.values_mut() {
+            let arrival = results_map.get(&stats.name).copied();
+            match arrival {
+                Some(value) => {
+                    let latency = value.saturating_sub(tx_sent_at_micros);
+                    stats.latencies.push(latency);
+                }
+                None => {
+                    stats.timeouts += 1;
+                }
+            }
+        }
+
+        if test_num < args.test_amount {
+            let (next_transaction, next_signature) =
+                build_transfer_transaction(&client, &keypair, lamports)?;
+
+            if let Some(sender) = shred_cmd.as_ref() {
+                if let Err(err) =
+                    sender.send(ListenerCommand::UpdateSignature(next_signature.clone()))
+                {
+                    println!("⚠ Failed to update Shred WS subscription: {}", err);
+                }
+            }
+
+            if let Some(sender) = local_cmd.as_ref() {
+                if let Err(err) =
+                    sender.send(ListenerCommand::UpdateSignature(next_signature.clone()))
+                {
+                    println!("⚠ Failed to update Local WS subscription: {}", err);
+                }
+            }
+
+            if let Some(sender) = local_enhanced_cmd.as_ref() {
+                if let Err(err) =
+                    sender.send(ListenerCommand::UpdateSignature(next_signature.clone()))
+                {
+                    println!("⚠ Failed to update Local Enhanced WS subscription: {}", err);
+                }
+            }
+
+            if let Some(sender) = helius_cmd.as_ref() {
+                if let Err(err) =
+                    sender.send(ListenerCommand::UpdateSignature(next_signature.clone()))
+                {
+                    println!("⚠ Failed to update Helius WS subscription: {}", err);
+                }
+            }
+
+            pending_transaction = Some(next_transaction);
+            pending_signature = Some(next_signature);
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    if args.test_amount > 1 {
+        println!("
+{}", "=".repeat(80));
+        println!(
+            "PERFORMANCE ANALYSIS ({} tests)",
+            args.test_amount
+        );
+        println!("{}", "=".repeat(80));
+        println!();
+        println!("┌──────────────────────┬────────────┬────────────┬────────────┬──────────────┐");
+        println!("│ Source               │ Avg (ms)   │ Min (ms)   │ Max (ms)   │ Success Rate │");
+        println!("├──────────────────────┼────────────┼────────────┼────────────┼──────────────┤");
+
+        for name in ["Shred WS", "Local WS", "Local Enhanced WS", "Helius WS"] {
+            if let Some(stats) = stats_map.get(name) {
+                println!(
+                    "│ {:<20} │ {:>10.3} │ {:>10.3} │ {:>10.3} │ {:>11.1}% │",
+                    name,
+                    stats.avg_latency_ms(),
+                    stats.min_latency_ms(),
+                    stats.max_latency_ms(),
+                    stats.success_rate(args.test_amount)
+                );
+            }
+        }
+
+        println!("└──────────────────────┴────────────┴────────────┴────────────┴──────────────┘");
     }
 
     Ok(())
