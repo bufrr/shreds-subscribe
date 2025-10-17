@@ -445,7 +445,7 @@ async fn handle_ws_message(
                         source_name,
                         format_hms_millis(received_ms)
                     );
-                    return true;
+                    return false; // Keep listener running for multi-test support
                 }
             }
             false
@@ -510,8 +510,10 @@ fn spawn_ws_listener(
                                     println!("↺ {} subscribed to new signature", source_name);
                                 }
                             }
+                        } else {
+                            // Only update signature filter for Account listeners (transactionSubscribe)
+                            current_signature = Some(sig);
                         }
-                        current_signature = Some(sig);
                     }
                 }
                 msg = ws.next() => {
