@@ -1,16 +1,22 @@
+use anyhow::{Context, Result as AnyhowResult, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use dashmap::DashMap;
+use futures_util::{SinkExt, StreamExt};
 use jsonrpc_core::{Error, ErrorCode, Params, Result};
 use jsonrpc_derive::rpc;
 use jsonrpc_http_server::{Server, ServerBuilder};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::signature::Signature;
+use solana_sdk::transaction::Transaction;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::Sender;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::info;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::{self, Sender};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct Subscription {
@@ -31,6 +37,16 @@ pub struct SubscribeResponse {
     pub status: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct WebSocketEndpointsConfig {
+    pub shred_ws_url: Option<String>,
+    pub local_ws_url: Option<String>,
+    pub local_enhanced_ws_url: Option<String>,
+    pub helius_ws_url: Option<String>,
+    pub wallet_address: String,
+    pub solana_rpc_url: String,
+}
+
 #[rpc(server)]
 pub trait Rpc {
     #[rpc(name = "subscribe_tx")]
@@ -39,6 +55,7 @@ pub trait Rpc {
 
 pub struct RpcImpl {
     pub subscriptions: Arc<DashMap<String, Subscription>>,
+    pub ws_config: Option<WebSocketEndpointsConfig>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -46,6 +63,22 @@ struct SubscribeParamsByName {
     tx_sig: String,
     // Only accept `timestamp` as milliseconds since UNIX epoch
     timestamp: u64,
+    transaction: Option<String>,
+}
+
+impl RpcImpl {
+    fn spawn_websocket_followups(
+        &self,
+        tx_sig: &str,
+        client_timestamp_ms: u64,
+        transaction: Option<String>,
+    ) {
+        if let Some(config) = self.ws_config.clone() {
+            spawn_ws_followups(config, tx_sig.to_string(), client_timestamp_ms, transaction);
+        } else if transaction.is_some() {
+            warn!("Transaction provided but no websocket configuration available; skipping send");
+        }
+    }
 }
 
 impl Rpc for RpcImpl {
@@ -70,8 +103,12 @@ impl Rpc for RpcImpl {
             }
         };
 
-        let tx_sig = parsed.tx_sig;
-        let timestamp_ms = parsed.timestamp;
+        let SubscribeParamsByName {
+            tx_sig,
+            timestamp,
+            transaction,
+        } = parsed;
+        let timestamp_ms = timestamp;
 
         // Validate timestamp precision (must be milliseconds since UNIX epoch)
         if timestamp_ms < 1_000_000_000_000 {
@@ -124,6 +161,8 @@ impl Rpc for RpcImpl {
             }
         }
 
+        self.spawn_websocket_followups(&tx_sig, timestamp_ms, transaction);
+
         // Return immediately with success status
         Ok(SubscribeResponse {
             status: "subscribed".to_string(),
@@ -131,11 +170,456 @@ impl Rpc for RpcImpl {
     }
 }
 
-pub async fn start_rpc_server(
+fn spawn_ws_followups(
+    config: WebSocketEndpointsConfig,
+    tx_sig: String,
+    client_timestamp_ms: u64,
+    transaction_base64: Option<String>,
+) {
+    tokio::spawn(async move {
+        let WebSocketEndpointsConfig {
+            shred_ws_url,
+            local_ws_url,
+            local_enhanced_ws_url,
+            helius_ws_url,
+            wallet_address,
+            solana_rpc_url,
+        } = config;
+
+        let (ready_tx, mut ready_rx) = mpsc::channel::<String>(4);
+        let mut subscription_count = 0usize;
+
+        if let Some(url) = shred_ws_url {
+            subscription_count += 1;
+            let signature = tx_sig.clone();
+            let ready = ready_tx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = run_signature_subscription(
+                    url,
+                    signature,
+                    "Shred WS",
+                    client_timestamp_ms,
+                    Some(ready),
+                )
+                .await
+                {
+                    warn!("Shred WS subscription task failed: {}", err);
+                }
+            });
+        }
+
+        if let Some(url) = local_ws_url {
+            subscription_count += 1;
+            let signature = tx_sig.clone();
+            let ready = ready_tx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = run_signature_subscription(
+                    url,
+                    signature,
+                    "Local WS",
+                    client_timestamp_ms,
+                    Some(ready),
+                )
+                .await
+                {
+                    warn!("Local WS subscription task failed: {}", err);
+                }
+            });
+        }
+
+        if let Some(url) = local_enhanced_ws_url {
+            if wallet_address.trim().is_empty() {
+                warn!(
+                    "Local Enhanced WS URL configured but wallet_address is empty; skipping subscription"
+                );
+            } else {
+                subscription_count += 1;
+                let signature = tx_sig.clone();
+                let wallet = wallet_address.clone();
+                let ready = ready_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = run_transaction_subscription(
+                        url,
+                        wallet,
+                        signature,
+                        "Local Enhanced WS",
+                        TransactionSubscriptionMode::LocalEnhanced,
+                        client_timestamp_ms,
+                        Some(ready),
+                    )
+                    .await
+                    {
+                        warn!("Local Enhanced WS subscription task failed: {}", err);
+                    }
+                });
+            }
+        }
+
+        if let Some(url) = helius_ws_url {
+            if wallet_address.trim().is_empty() {
+                warn!(
+                    "Helius WS URL configured but wallet_address is empty; skipping subscription"
+                );
+            } else {
+                subscription_count += 1;
+                let wallet = wallet_address;
+                let signature = tx_sig.clone();
+                let ready = ready_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = run_transaction_subscription(
+                        url,
+                        wallet,
+                        signature,
+                        "Helius WS",
+                        TransactionSubscriptionMode::Helius,
+                        client_timestamp_ms,
+                        Some(ready),
+                    )
+                    .await
+                    {
+                        warn!("Helius WS subscription task failed: {}", err);
+                    }
+                });
+            }
+        }
+
+        drop(ready_tx);
+
+        if subscription_count > 0 {
+            let mut ready_count = 0usize;
+            let timeout = tokio::time::sleep(Duration::from_secs(2));
+            tokio::pin!(timeout);
+
+            while ready_count < subscription_count {
+                tokio::select! {
+                    _ = &mut timeout => {
+                        warn!(
+                            "Subscription readiness timeout: {}/{} ready before sending transaction",
+                            ready_count, subscription_count
+                        );
+                        break;
+                    }
+                    maybe_source = ready_rx.recv() => {
+                        match maybe_source {
+                            Some(source) => {
+                                ready_count += 1;
+                                info!("✓ {} subscription confirmed", source);
+                                if ready_count >= subscription_count {
+                                    info!("All {} subscriptions confirmed", subscription_count);
+                                    break;
+                                }
+                            }
+                            None => {
+                                warn!(
+                                    "Subscription readiness channel closed early: {}/{} ready",
+                                    ready_count, subscription_count
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ready_count < subscription_count {
+                warn!(
+                    "Proceeding with transaction send after partial readiness: {}/{} ready",
+                    ready_count, subscription_count
+                );
+            }
+        }
+
+        match transaction_base64 {
+            Some(tx_base64) => {
+                if solana_rpc_url.trim().is_empty() {
+                    warn!("Solana RPC URL missing; unable to send transaction");
+                } else {
+                    match send_transaction_to_solana(&solana_rpc_url, &tx_base64) {
+                        Ok(_) => {
+                            info!("✓ Transaction sent to Solana at {} µs", current_micros());
+                        }
+                        Err(err) => {
+                            warn!("⚠ Failed to send transaction to Solana: {}", err);
+                        }
+                    }
+                }
+            }
+            None => {
+                warn!("Transaction payload missing; skipping send to Solana RPC");
+            }
+        }
+    });
+}
+
+fn send_transaction_to_solana(rpc_url: &str, transaction_base64: &str) -> AnyhowResult<()> {
+    let transaction_bytes = BASE64
+        .decode(transaction_base64.trim())
+        .context("Failed to decode transaction from base64")?;
+
+    let transaction: Transaction =
+        bincode::deserialize(&transaction_bytes).context("Failed to deserialize transaction")?;
+
+    let client = RpcClient::new(rpc_url.to_string());
+    client
+        .send_transaction(&transaction)
+        .context("Failed to send transaction to Solana")?;
+
+    Ok(())
+}
+
+#[derive(Copy, Clone)]
+enum TransactionSubscriptionMode {
+    LocalEnhanced,
+    Helius,
+}
+
+async fn run_signature_subscription(
+    url: String,
+    signature: String,
+    source_name: &'static str,
+    client_timestamp_ms: u64,
+    ready_notifier: Option<Sender<String>>,
+) -> AnyhowResult<()> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "signatureSubscribe",
+        "params": [signature, {"commitment": "processed"}]
+    });
+
+    run_ws_task(
+        url,
+        request,
+        source_name,
+        "signatureNotification",
+        ready_notifier,
+        None,
+        client_timestamp_ms,
+    )
+    .await
+}
+
+async fn run_transaction_subscription(
+    url: String,
+    wallet: String,
+    signature: String,
+    source_name: &'static str,
+    mode: TransactionSubscriptionMode,
+    client_timestamp_ms: u64,
+    ready_notifier: Option<Sender<String>>,
+) -> AnyhowResult<()> {
+    let request = build_transaction_subscription_request(&wallet, mode);
+    run_ws_task(
+        url,
+        request,
+        source_name,
+        "transactionNotification",
+        ready_notifier,
+        Some(signature),
+        client_timestamp_ms,
+    )
+    .await
+}
+
+fn build_transaction_subscription_request(
+    wallet: &str,
+    mode: TransactionSubscriptionMode,
+) -> Value {
+    match mode {
+        TransactionSubscriptionMode::LocalEnhanced => json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "transactionSubscribe",
+            "params": [
+                {
+                    "failed": false,
+                    "accounts": {
+                        "include": [wallet]
+                    }
+                },
+                {
+                    "commitment": "processed",
+                    "encoding": "jsonParsed",
+                    "transactionDetails": "full",
+                    "maxSupportedTransactionVersion": 0
+                }
+            ]
+        }),
+        TransactionSubscriptionMode::Helius => json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "transactionSubscribe",
+            "params": [
+                {
+                    "failed": false,
+                    "accountInclude": [wallet]
+                },
+                {
+                    "commitment": "processed",
+                    "encoding": "jsonParsed",
+                    "transactionDetails": "full",
+                    "maxSupportedTransactionVersion": 0
+                }
+            ]
+        }),
+    }
+}
+
+async fn run_ws_task(
+    url: String,
+    request: Value,
+    source_name: &'static str,
+    expected_method: &'static str,
+    ready_notifier: Option<Sender<String>>,
+    signature_filter: Option<String>,
+    client_timestamp_ms: u64,
+) -> AnyhowResult<()> {
+    let (mut ws, _) = connect_async(&url)
+        .await
+        .with_context(|| format!("Failed to connect to {}", source_name))?;
+
+    ws.send(Message::Text(request.to_string().into()))
+        .await
+        .with_context(|| format!("Failed to send subscription request to {}", source_name))?;
+
+    let mut received_notification = false;
+    let mut ready_notifier = ready_notifier;
+    let mut subscription_confirmed = ready_notifier.is_none();
+
+    while let Some(message) = ws.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let value = match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(
+                            "{} returned non-JSON text: {}; err: {}",
+                            source_name, text, err
+                        );
+                        continue;
+                    }
+                };
+
+                if let Some(error) = value.get("error") {
+                    return Err(anyhow!(
+                        "{} subscription error response: {}",
+                        source_name,
+                        error
+                    ));
+                }
+
+                if !subscription_confirmed && value.get("result").is_some() {
+                    if let Some(notifier) = ready_notifier.take() {
+                        if notifier.send(source_name.to_string()).await.is_err() {
+                            warn!(
+                                "{} subscription ready signal dropped before being received",
+                                source_name
+                            );
+                        }
+                    }
+                    subscription_confirmed = true;
+                    continue;
+                }
+
+                if value.get("method").and_then(|method| method.as_str()) != Some(expected_method) {
+                    continue;
+                }
+
+                if let Some(expected) = signature_filter.as_deref() {
+                    let maybe_sig = extract_notification_signature(&value);
+                    if maybe_sig != Some(expected) {
+                        if let Some(mut sig) = maybe_sig.map(str::to_string) {
+                            const MAX_PREVIEW: usize = 8;
+                            if sig.len() > MAX_PREVIEW {
+                                sig.truncate(MAX_PREVIEW);
+                            }
+                            warn!(
+                                "{} ignored {} for signature {} (expected {})",
+                                source_name, expected_method, sig, expected
+                            );
+                        } else {
+                            warn!(
+                                "{} ignored {} missing signature field",
+                                source_name, expected_method
+                            );
+                        }
+                        continue;
+                    }
+                }
+
+                let arrival_micros = current_micros();
+                let client_micros = (client_timestamp_ms as u128).saturating_mul(1_000);
+                let latency_ms =
+                    (arrival_micros.saturating_sub(client_micros) as f64) / 1_000.0_f64;
+
+                info!(
+                    "{} notification received at {}us (latency: {:.3} ms)",
+                    source_name, arrival_micros, latency_ms
+                );
+
+                received_notification = true;
+                break;
+            }
+            Ok(Message::Ping(payload)) => {
+                ws.send(Message::Pong(payload))
+                    .await
+                    .with_context(|| format!("Failed to reply to ping from {}", source_name))?;
+            }
+            Ok(Message::Close(_)) => {
+                break;
+            }
+            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
+            Err(err) => {
+                return Err(err.into());
+            }
+        }
+    }
+
+    if received_notification {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} connection closed before notification was received",
+            source_name
+        ))
+    }
+}
+
+fn extract_notification_signature(value: &Value) -> Option<&str> {
+    value
+        .get("params")
+        .and_then(|params| params.get("result"))
+        .and_then(|result| result.get("signature"))
+        .and_then(|sig| sig.as_str())
+        .or_else(|| {
+            value
+                .get("params")
+                .and_then(|params| params.get("result"))
+                .and_then(|result| result.get("value"))
+                .and_then(|value| value.get("transaction"))
+                .and_then(|transaction| transaction.get("transaction"))
+                .and_then(|transaction| transaction.get("signatures"))
+                .and_then(|sigs| sigs.get(0))
+                .and_then(|sig| sig.as_str())
+        })
+}
+
+fn current_micros() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros())
+        .unwrap_or_default()
+}
+
+pub async fn start_rpc_server_with_ws_config(
     addr: SocketAddr,
     subscriptions: Arc<DashMap<String, Subscription>>,
+    ws_config: Option<WebSocketEndpointsConfig>,
 ) -> std::result::Result<Server, jsonrpc_core::Error> {
-    let rpc_impl = RpcImpl { subscriptions };
+    let rpc_impl = RpcImpl {
+        subscriptions,
+        ws_config,
+    };
 
     let mut io = jsonrpc_core::IoHandler::new();
     io.extend_with(rpc_impl.to_delegate());

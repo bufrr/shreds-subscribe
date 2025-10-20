@@ -41,6 +41,48 @@ struct Args {
     #[arg(long, env = "WS_PORT", help = "Port for WebSocket server")]
     ws_port: Option<u16>,
 
+    #[arg(
+        long,
+        env = "SHRED_WS_URL",
+        help = "Shred WebSocket URL for subscribe_tx tracking"
+    )]
+    shred_ws_url: Option<String>,
+
+    #[arg(
+        long,
+        env = "LOCAL_WS_URL",
+        help = "Local Solana WebSocket URL for subscribe_tx tracking"
+    )]
+    local_ws_url: Option<String>,
+
+    #[arg(
+        long,
+        env = "LOCAL_ENHANCED_WS_URL",
+        help = "Local Enhanced WebSocket URL for subscribe_tx tracking"
+    )]
+    local_enhanced_ws_url: Option<String>,
+
+    #[arg(
+        long,
+        env = "HELIUS_WS_URL",
+        help = "Helius WebSocket URL for subscribe_tx tracking"
+    )]
+    helius_ws_url: Option<String>,
+
+    #[arg(
+        long,
+        env = "WALLET_ADDRESS",
+        help = "Wallet address for transactionSubscribe tracking"
+    )]
+    wallet_address: Option<String>,
+
+    #[arg(
+        long,
+        env = "SOLANA_RPC_URL",
+        help = "Solana RPC URL used to forward transactions after subscriptions are ready"
+    )]
+    solana_rpc_url: Option<String>,
+
     #[arg(long, env = "CONFIG_PATH", help = "Path to a config TOML file")]
     config_path: Option<String>,
 }
@@ -52,6 +94,7 @@ struct Config {
     ws_port: Option<u16>,
     trace_log_path: Option<String>,
     log_path: Option<String>,
+    solana_rpc_url: Option<String>,
 }
 
 /// Simple logging setup - returns guard that must be kept alive
@@ -116,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
     config.ws_port = args.ws_port.or(config.ws_port);
     config.log_path = args.log_path.or(config.log_path);
     config.trace_log_path = args.trace_log_path.or(config.trace_log_path);
+    config.solana_rpc_url = args.solana_rpc_url.clone().or(config.solana_rpc_url);
 
     // Setup logging (both console and file if log_path is provided)
     let _log_guard = init_logging(config.log_path.as_deref())?;
@@ -136,9 +180,28 @@ async fn main() -> anyhow::Result<()> {
     let deshred_subscriptions = subscriptions.clone();
     let ws_subscriptions = subscriptions.clone();
 
+    // Build WebSocket endpoints config for subscribe_tx tracking
+    let ws_config = if args.shred_ws_url.is_some()
+        || args.local_ws_url.is_some()
+        || args.local_enhanced_ws_url.is_some()
+        || args.helius_ws_url.is_some()
+    {
+        Some(rpc::WebSocketEndpointsConfig {
+            shred_ws_url: args.shred_ws_url,
+            local_ws_url: args.local_ws_url,
+            local_enhanced_ws_url: args.local_enhanced_ws_url,
+            helius_ws_url: args.helius_ws_url,
+            wallet_address: args.wallet_address.unwrap_or_default(),
+            solana_rpc_url: config.solana_rpc_url.clone().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+
     // Start RPC server
     let rpc_addr: SocketAddr = format!("0.0.0.0:{}", rpc_port).parse()?;
-    let rpc_server = rpc::start_rpc_server(rpc_addr, subscriptions.clone()).await?;
+    let rpc_server =
+        rpc::start_rpc_server_with_ws_config(rpc_addr, subscriptions.clone(), ws_config).await?;
     info!("RPC server started on port {}", rpc_port);
 
     let ws_addr: SocketAddr = format!("0.0.0.0:{}", ws_port).parse()?;

@@ -31,6 +31,8 @@ solana-client = "3.0.0"
 solana-commitment-config = "3.0.0"
 solana-system-transaction = "3.0.0"
 chrono = "0.4"
+base64 = "0.22"
+reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 dotenvy = "0.15"
