@@ -71,13 +71,6 @@ struct Args {
 
     #[arg(
         long,
-        env = "WALLET_ADDRESS",
-        help = "Wallet address for transactionSubscribe tracking"
-    )]
-    wallet_address: Option<String>,
-
-    #[arg(
-        long,
         env = "SOLANA_RPC_URL",
         help = "Solana RPC URL used to forward transactions after subscriptions are ready"
     )]
@@ -191,7 +184,6 @@ async fn main() -> anyhow::Result<()> {
             local_ws_url: args.local_ws_url,
             local_enhanced_ws_url: args.local_enhanced_ws_url,
             helius_ws_url: args.helius_ws_url,
-            wallet_address: args.wallet_address.unwrap_or_default(),
             solana_rpc_url: config.solana_rpc_url.clone().unwrap_or_default(),
         })
     } else {

@@ -43,7 +43,6 @@ pub struct WebSocketEndpointsConfig {
     pub local_ws_url: Option<String>,
     pub local_enhanced_ws_url: Option<String>,
     pub helius_ws_url: Option<String>,
-    pub wallet_address: String,
     pub solana_rpc_url: String,
 }
 
@@ -182,7 +181,6 @@ fn spawn_ws_followups(
             local_ws_url,
             local_enhanced_ws_url,
             helius_ws_url,
-            wallet_address,
             solana_rpc_url,
         } = config;
 
@@ -228,59 +226,41 @@ fn spawn_ws_followups(
         }
 
         if let Some(url) = local_enhanced_ws_url {
-            if wallet_address.trim().is_empty() {
-                warn!(
-                    "Local Enhanced WS URL configured but wallet_address is empty; skipping subscription"
-                );
-            } else {
-                subscription_count += 1;
-                let signature = tx_sig.clone();
-                let wallet = wallet_address.clone();
-                let ready = ready_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = run_transaction_subscription(
-                        url,
-                        wallet,
-                        signature,
-                        "Local Enhanced WS",
-                        TransactionSubscriptionMode::LocalEnhanced,
-                        client_timestamp_ms,
-                        Some(ready),
-                    )
-                    .await
-                    {
-                        warn!("Local Enhanced WS subscription task failed: {}", err);
-                    }
-                });
-            }
+            subscription_count += 1;
+            let signature = tx_sig.clone();
+            let ready = ready_tx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = run_signature_subscription(
+                    url,
+                    signature,
+                    "Local Enhanced WS",
+                    client_timestamp_ms,
+                    Some(ready),
+                )
+                .await
+                {
+                    warn!("Local Enhanced WS subscription task failed: {}", err);
+                }
+            });
         }
 
         if let Some(url) = helius_ws_url {
-            if wallet_address.trim().is_empty() {
-                warn!(
-                    "Helius WS URL configured but wallet_address is empty; skipping subscription"
-                );
-            } else {
-                subscription_count += 1;
-                let wallet = wallet_address;
-                let signature = tx_sig.clone();
-                let ready = ready_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = run_transaction_subscription(
-                        url,
-                        wallet,
-                        signature,
-                        "Helius WS",
-                        TransactionSubscriptionMode::Helius,
-                        client_timestamp_ms,
-                        Some(ready),
-                    )
-                    .await
-                    {
-                        warn!("Helius WS subscription task failed: {}", err);
-                    }
-                });
-            }
+            subscription_count += 1;
+            let signature = tx_sig.clone();
+            let ready = ready_tx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = run_signature_subscription(
+                    url,
+                    signature,
+                    "Helius WS",
+                    client_timestamp_ms,
+                    Some(ready),
+                )
+                .await
+                {
+                    warn!("Helius WS subscription task failed: {}", err);
+                }
+            });
         }
 
         drop(ready_tx);
@@ -367,12 +347,6 @@ fn send_transaction_to_solana(rpc_url: &str, transaction_base64: &str) -> Anyhow
     Ok(())
 }
 
-#[derive(Copy, Clone)]
-enum TransactionSubscriptionMode {
-    LocalEnhanced,
-    Helius,
-}
-
 async fn run_signature_subscription(
     url: String,
     signature: String,
@@ -397,72 +371,6 @@ async fn run_signature_subscription(
         client_timestamp_ms,
     )
     .await
-}
-
-async fn run_transaction_subscription(
-    url: String,
-    wallet: String,
-    signature: String,
-    source_name: &'static str,
-    mode: TransactionSubscriptionMode,
-    client_timestamp_ms: u64,
-    ready_notifier: Option<Sender<String>>,
-) -> AnyhowResult<()> {
-    let request = build_transaction_subscription_request(&wallet, mode);
-    run_ws_task(
-        url,
-        request,
-        source_name,
-        "transactionNotification",
-        ready_notifier,
-        Some(signature),
-        client_timestamp_ms,
-    )
-    .await
-}
-
-fn build_transaction_subscription_request(
-    wallet: &str,
-    mode: TransactionSubscriptionMode,
-) -> Value {
-    match mode {
-        TransactionSubscriptionMode::LocalEnhanced => json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "transactionSubscribe",
-            "params": [
-                {
-                    "failed": false,
-                    "accounts": {
-                        "include": [wallet]
-                    }
-                },
-                {
-                    "commitment": "processed",
-                    "encoding": "jsonParsed",
-                    "transactionDetails": "full",
-                    "maxSupportedTransactionVersion": 0
-                }
-            ]
-        }),
-        TransactionSubscriptionMode::Helius => json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "transactionSubscribe",
-            "params": [
-                {
-                    "failed": false,
-                    "accountInclude": [wallet]
-                },
-                {
-                    "commitment": "processed",
-                    "encoding": "jsonParsed",
-                    "transactionDetails": "full",
-                    "maxSupportedTransactionVersion": 0
-                }
-            ]
-        }),
-    }
 }
 
 async fn run_ws_task(
