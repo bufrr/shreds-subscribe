@@ -11,6 +11,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::Transaction;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -231,12 +232,14 @@ fn spawn_ws_followups(
         } = config;
 
         let (ready_tx, mut ready_rx) = mpsc::channel::<String>(4);
+        let (summary_tx, mut summary_rx) = mpsc::channel::<(&'static str, f64)>(4);
         let mut subscription_count = 0usize;
 
         if let Some(url) = shred_ws_url {
             subscription_count += 1;
             let signature = tx_sig.clone();
             let ready = ready_tx.clone();
+            let summary = summary_tx.clone();
             tokio::spawn(async move {
                 if let Err(err) = run_signature_subscription(
                     url,
@@ -244,6 +247,7 @@ fn spawn_ws_followups(
                     "Shred WS",
                     client_timestamp_ms,
                     Some(ready),
+                    Some(summary),
                 )
                 .await
                 {
@@ -256,6 +260,7 @@ fn spawn_ws_followups(
             subscription_count += 1;
             let signature = tx_sig.clone();
             let ready = ready_tx.clone();
+            let summary = summary_tx.clone();
             tokio::spawn(async move {
                 if let Err(err) = run_signature_subscription(
                     url,
@@ -263,6 +268,7 @@ fn spawn_ws_followups(
                     "Local WS",
                     client_timestamp_ms,
                     Some(ready),
+                    Some(summary),
                 )
                 .await
                 {
@@ -275,6 +281,7 @@ fn spawn_ws_followups(
             subscription_count += 1;
             let signature = tx_sig.clone();
             let ready = ready_tx.clone();
+            let summary = summary_tx.clone();
             tokio::spawn(async move {
                 if let Err(err) = run_signature_subscription(
                     url,
@@ -282,6 +289,7 @@ fn spawn_ws_followups(
                     "Local Enhanced WS",
                     client_timestamp_ms,
                     Some(ready),
+                    Some(summary),
                 )
                 .await
                 {
@@ -295,6 +303,7 @@ fn spawn_ws_followups(
                 subscription_count += 1;
                 let signature = tx_sig.clone();
                 let ready = ready_tx.clone();
+                let summary = summary_tx.clone();
                 tokio::spawn(async move {
                     if let Err(err) = run_helius_subscription(
                         url,
@@ -303,6 +312,7 @@ fn spawn_ws_followups(
                         "Helius WS",
                         client_timestamp_ms,
                         Some(ready),
+                        Some(summary),
                     )
                     .await
                     {
@@ -317,6 +327,7 @@ fn spawn_ws_followups(
         }
 
         drop(ready_tx);
+        drop(summary_tx);
 
         if subscription_count > 0 {
             let mut ready_count = 0usize;
@@ -381,6 +392,51 @@ fn spawn_ws_followups(
                 warn!("Transaction payload missing; skipping send to Solana RPC");
             }
         }
+
+        let expected_results = subscription_count;
+
+        if expected_results == 0 {
+            info!(
+                "LATENCY_SUMMARY tx_sig={} shred_ws=TIMEOUT local_ws=TIMEOUT local_enhanced_ws=TIMEOUT helius_ws=TIMEOUT",
+                tx_sig
+            );
+            return;
+        }
+
+        let mut results: HashMap<&'static str, f64> = HashMap::new();
+        let summary_timeout = tokio::time::sleep(Duration::from_secs(10));
+        tokio::pin!(summary_timeout);
+
+        loop {
+            tokio::select! {
+                _ = &mut summary_timeout => {
+                    break;
+                }
+                maybe_update = summary_rx.recv() => {
+                    match maybe_update {
+                        Some((key, latency)) => {
+                            results.entry(key).or_insert(latency);
+                            if results.len() >= expected_results {
+                                break;
+                            }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let shred_ws_value = format_summary_value("shred_ws", &results);
+        let local_ws_value = format_summary_value("local_ws", &results);
+        let local_enhanced_ws_value = format_summary_value("local_enhanced_ws", &results);
+        let helius_ws_value = format_summary_value("helius_ws", &results);
+
+        info!(
+            "LATENCY_SUMMARY tx_sig={} shred_ws={} local_ws={} local_enhanced_ws={} helius_ws={}",
+            tx_sig, shred_ws_value, local_ws_value, local_enhanced_ws_value, helius_ws_value
+        );
     });
 }
 
@@ -406,6 +462,7 @@ async fn run_signature_subscription(
     source_name: &'static str,
     client_timestamp_ms: u64,
     ready_notifier: Option<Sender<String>>,
+    summary_sender: Option<Sender<(&'static str, f64)>>,
 ) -> AnyhowResult<()> {
     let request = json!({
         "jsonrpc": "2.0",
@@ -420,6 +477,7 @@ async fn run_signature_subscription(
         source_name,
         "signatureNotification",
         ready_notifier,
+        summary_sender,
         None,
         client_timestamp_ms,
     )
@@ -433,6 +491,7 @@ async fn run_helius_subscription(
     source_name: &'static str,
     client_timestamp_ms: u64,
     ready_notifier: Option<Sender<String>>,
+    summary_sender: Option<Sender<(&'static str, f64)>>,
 ) -> AnyhowResult<()> {
     let request = json!({
         "jsonrpc": "2.0",
@@ -459,6 +518,7 @@ async fn run_helius_subscription(
         source_name,
         "transactionNotification",
         ready_notifier,
+        summary_sender,
         Some(signature),
         client_timestamp_ms,
     )
@@ -471,6 +531,7 @@ async fn run_ws_task(
     source_name: &'static str,
     expected_method: &'static str,
     ready_notifier: Option<Sender<String>>,
+    summary_sender: Option<Sender<(&'static str, f64)>>,
     signature_filter: Option<String>,
     client_timestamp_ms: u64,
 ) -> AnyhowResult<()> {
@@ -557,6 +618,21 @@ async fn run_ws_task(
                     source_name, arrival_micros, latency_ms
                 );
 
+                if let Some(summary_sender) = summary_sender.as_ref() {
+                    if let Some(summary_key) = summary_key_for_source(source_name) {
+                        if summary_sender
+                            .send((summary_key, latency_ms))
+                            .await
+                            .is_err()
+                        {
+                            warn!(
+                                "Latency summary channel closed before recording {} notification",
+                                source_name
+                            );
+                        }
+                    }
+                }
+
                 received_notification = true;
                 break;
             }
@@ -602,6 +678,23 @@ fn extract_notification_signature(value: &Value) -> Option<&str> {
                 .and_then(|sigs| sigs.get(0))
                 .and_then(|sig| sig.as_str())
         })
+}
+
+fn summary_key_for_source(source_name: &str) -> Option<&'static str> {
+    match source_name {
+        "Shred WS" => Some("shred_ws"),
+        "Local WS" => Some("local_ws"),
+        "Local Enhanced WS" => Some("local_enhanced_ws"),
+        "Helius WS" => Some("helius_ws"),
+        _ => None,
+    }
+}
+
+fn format_summary_value(key: &'static str, results: &HashMap<&'static str, f64>) -> String {
+    results
+        .get(key)
+        .map(|latency| format!("{:.3}ms", latency))
+        .unwrap_or_else(|| "TIMEOUT".to_string())
 }
 
 fn current_micros() -> u128 {
