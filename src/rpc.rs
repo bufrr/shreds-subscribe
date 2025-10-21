@@ -25,6 +25,7 @@ pub struct Subscription {
     pub client_timestamp_ms: u64, // Client-provided timestamp for latency tracking
     pub rpc_received_ms: u64,     // Server timestamp when RPC was received
     pub websocket: Option<WebsocketSubscription>,
+    pub summary_sender: Option<Sender<(&'static str, f64)>>, // For sending latency to LATENCY_SUMMARY
 }
 
 #[derive(Debug)]
@@ -82,6 +83,7 @@ impl RpcImpl {
                 client_timestamp_ms,
                 transaction,
                 wallet_address,
+                self.subscriptions.clone(),
             );
         }
     }
@@ -146,6 +148,7 @@ impl Rpc for RpcImpl {
             client_timestamp_ms: timestamp_ms,
             rpc_received_ms,
             websocket: None,
+            summary_sender: None,
         };
 
         // Try to insert the subscription
@@ -221,6 +224,7 @@ fn spawn_ws_followups(
     client_timestamp_ms: u64,
     transaction_base64: Option<String>,
     wallet_address: Option<String>,
+    subscriptions: Arc<DashMap<String, Subscription>>,
 ) {
     tokio::spawn(async move {
         let WebSocketEndpointsConfig {
@@ -246,6 +250,11 @@ fn spawn_ws_followups(
                     "Skipping external Shred WS subscription for {} (localhost detected - using internal deshred notifications)",
                     url
                 );
+
+                // Store summary_tx in subscription so deshred can report latency
+                if let Some(mut sub) = subscriptions.get_mut(&tx_sig) {
+                    sub.summary_sender = Some(summary_tx.clone());
+                }
             } else {
                 subscription_count += 1;
                 let signature = tx_sig.clone();

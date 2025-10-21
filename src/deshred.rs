@@ -354,6 +354,11 @@ pub fn reconstruct_shreds(
                         shred_received_at_ms
                     );
 
+                    // Send latency to summary channel if present
+                    if let Some(summary_sender) = subscription.summary_sender.take() {
+                        let _ = summary_sender.try_send(("shred_ws", total_latency_ms as f64));
+                    }
+
                     if let Some(websocket) = subscription.websocket.take() {
                         if notif_tx.send((tx_sig.clone(), *slot, websocket)).is_err() {
                             debug!("Failed to queue notification for {}", tx_sig);

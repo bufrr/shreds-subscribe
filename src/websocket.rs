@@ -364,6 +364,7 @@ fn handle_signature_subscribe(
                 client_timestamp_ms: now_ms,
                 rpc_received_ms: now_ms,
                 websocket: Some(websocket),
+                summary_sender: None,
             };
 
             entry.insert(subscription);
