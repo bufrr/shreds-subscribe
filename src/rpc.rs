@@ -236,24 +236,36 @@ fn spawn_ws_followups(
         let mut subscription_count = 0usize;
 
         if let Some(url) = shred_ws_url {
-            subscription_count += 1;
-            let signature = tx_sig.clone();
-            let ready = ready_tx.clone();
-            let summary = summary_tx.clone();
-            tokio::spawn(async move {
-                if let Err(err) = run_signature_subscription(
-                    url,
-                    signature,
-                    "Shred WS",
-                    client_timestamp_ms,
-                    Some(ready),
-                    Some(summary),
-                )
-                .await
-                {
-                    warn!("Shred WS subscription task failed: {}", err);
-                }
-            });
+            // Skip Shred WS subscription if it points to localhost - the deshred module
+            // already handles this internally, and external subscription would conflict
+            let is_localhost =
+                url.contains("localhost") || url.contains("127.0.0.1") || url.contains("[::1]");
+
+            if is_localhost {
+                info!(
+                    "Skipping external Shred WS subscription for {} (localhost detected - using internal deshred notifications)",
+                    url
+                );
+            } else {
+                subscription_count += 1;
+                let signature = tx_sig.clone();
+                let ready = ready_tx.clone();
+                let summary = summary_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = run_signature_subscription(
+                        url,
+                        signature,
+                        "Shred WS",
+                        client_timestamp_ms,
+                        Some(ready),
+                        Some(summary),
+                    )
+                    .await
+                    {
+                        warn!("Shred WS subscription task failed: {}", err);
+                    }
+                });
+            }
         }
 
         if let Some(url) = local_ws_url {
