@@ -255,6 +255,7 @@ fn spawn_ws_followups(
                 if let Some(mut sub) = subscriptions.get_mut(&tx_sig) {
                     sub.summary_sender = Some(summary_tx.clone());
                 }
+                subscription_count += 1; // Count it - deshred will report result
             } else {
                 subscription_count += 1;
                 let signature = tx_sig.clone();
@@ -425,7 +426,7 @@ fn spawn_ws_followups(
         }
 
         let mut results: HashMap<&'static str, f64> = HashMap::new();
-        let summary_timeout = tokio::time::sleep(Duration::from_secs(10));
+        let summary_timeout = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(summary_timeout);
 
         loop {
