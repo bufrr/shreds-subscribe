@@ -256,6 +256,9 @@ fn spawn_ws_followups(
                     sub.summary_sender = Some(summary_tx.clone());
                 }
                 subscription_count += 1; // Count it - deshred will report result
+
+                // Send ready signal immediately - deshred is always ready
+                let _ = ready_tx.send("Shred WS".to_string()).await;
             } else {
                 subscription_count += 1;
                 let signature = tx_sig.clone();
@@ -402,7 +405,7 @@ fn spawn_ws_followups(
                 } else {
                     match send_transaction_to_solana(&solana_rpc_url, &tx_base64) {
                         Ok(_) => {
-                            info!("✓ Transaction sent to Solana at {} µs", current_micros());
+                            info!("✓ Transaction sent to Solana at {} ms", current_millis());
                         }
                         Err(err) => {
                             warn!("⚠ Failed to send transaction to Solana: {}", err);
@@ -630,14 +633,13 @@ async fn run_ws_task(
                     }
                 }
 
-                let arrival_micros = current_micros();
-                let client_micros = (client_timestamp_ms as u128).saturating_mul(1_000);
-                let latency_ms =
-                    (arrival_micros.saturating_sub(client_micros) as f64) / 1_000.0_f64;
+                let arrival_ms = current_millis();
+                let client_ms = client_timestamp_ms as u128;
+                let latency_ms = arrival_ms.saturating_sub(client_ms) as f64;
 
                 info!(
-                    "{} notification received at {}us (latency: {:.3} ms)",
-                    source_name, arrival_micros, latency_ms
+                    "{} notification received at {} ms (latency: {:.3} ms)",
+                    source_name, arrival_ms, latency_ms
                 );
 
                 if let Some(summary_sender) = summary_sender.as_ref() {
@@ -719,10 +721,10 @@ fn format_summary_value(key: &'static str, results: &HashMap<&'static str, f64>)
         .unwrap_or_else(|| "TIMEOUT".to_string())
 }
 
-fn current_micros() -> u128 {
+fn current_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_micros())
+        .map(|duration| duration.as_millis())
         .unwrap_or_default()
 }
 
