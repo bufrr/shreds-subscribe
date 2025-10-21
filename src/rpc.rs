@@ -82,8 +82,6 @@ impl RpcImpl {
                 transaction,
                 wallet_address,
             );
-        } else if transaction.is_some() {
-            warn!("Transaction provided but no websocket configuration available; skipping send");
         }
     }
 }
@@ -168,9 +166,13 @@ impl Rpc for RpcImpl {
             }
         }
 
-        let wallet_address = transaction.as_ref().and_then(|tx_base64| {
+        let wallet_address = if let Some(tx_base64) = transaction.as_ref() {
             match extract_fee_payer_from_transaction(tx_base64) {
-                Ok(pubkey) => Some(pubkey.to_string()),
+                Ok(pubkey) => {
+                    let addr = pubkey.to_string();
+                    info!("Extracted wallet address {} for tx {}", addr, tx_sig);
+                    Some(addr)
+                }
                 Err(err) => {
                     warn!(
                         "Failed to extract fee payer from transaction for {}: {}",
@@ -179,7 +181,13 @@ impl Rpc for RpcImpl {
                     None
                 }
             }
-        });
+        } else {
+            warn!(
+                "No transaction provided for tx {}, Helius subscription will be skipped",
+                tx_sig
+            );
+            None
+        };
 
         self.spawn_websocket_followups(&tx_sig, timestamp_ms, transaction, wallet_address);
 
