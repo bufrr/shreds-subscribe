@@ -249,7 +249,7 @@ fn spawn_ws_followups(
             let signature = tx_sig.clone();
             let ready = ready_tx.clone();
             tokio::spawn(async move {
-                if let Err(err) = run_signature_subscription(
+                if let Err(err) = run_helius_subscription(
                     url,
                     signature,
                     "Helius WS",
@@ -368,6 +368,43 @@ async fn run_signature_subscription(
         "signatureNotification",
         ready_notifier,
         None,
+        client_timestamp_ms,
+    )
+    .await
+}
+
+async fn run_helius_subscription(
+    url: String,
+    signature: String,
+    source_name: &'static str,
+    client_timestamp_ms: u64,
+    ready_notifier: Option<Sender<String>>,
+) -> AnyhowResult<()> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "transactionSubscribe",
+        "params": [
+            {
+                "signature": signature.clone(),
+                "failed": false
+            },
+            {
+                "commitment": "processed",
+                "encoding": "jsonParsed",
+                "transactionDetails": "full",
+                "maxSupportedTransactionVersion": 0
+            }
+        ]
+    });
+
+    run_ws_task(
+        url,
+        request,
+        source_name,
+        "transactionNotification",
+        ready_notifier,
+        Some(signature),
         client_timestamp_ms,
     )
     .await
