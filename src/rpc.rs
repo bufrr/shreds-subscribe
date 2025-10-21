@@ -8,6 +8,7 @@ use jsonrpc_http_server::{Server, ServerBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use solana_client::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::Transaction;
 use std::net::SocketAddr;
@@ -71,9 +72,16 @@ impl RpcImpl {
         tx_sig: &str,
         client_timestamp_ms: u64,
         transaction: Option<String>,
+        wallet_address: Option<String>,
     ) {
         if let Some(config) = self.ws_config.clone() {
-            spawn_ws_followups(config, tx_sig.to_string(), client_timestamp_ms, transaction);
+            spawn_ws_followups(
+                config,
+                tx_sig.to_string(),
+                client_timestamp_ms,
+                transaction,
+                wallet_address,
+            );
         } else if transaction.is_some() {
             warn!("Transaction provided but no websocket configuration available; skipping send");
         }
@@ -160,7 +168,20 @@ impl Rpc for RpcImpl {
             }
         }
 
-        self.spawn_websocket_followups(&tx_sig, timestamp_ms, transaction);
+        let wallet_address = transaction.as_ref().and_then(|tx_base64| {
+            match extract_fee_payer_from_transaction(tx_base64) {
+                Ok(pubkey) => Some(pubkey.to_string()),
+                Err(err) => {
+                    warn!(
+                        "Failed to extract fee payer from transaction for {}: {}",
+                        tx_sig, err
+                    );
+                    None
+                }
+            }
+        });
+
+        self.spawn_websocket_followups(&tx_sig, timestamp_ms, transaction, wallet_address);
 
         // Return immediately with success status
         Ok(SubscribeResponse {
@@ -169,11 +190,28 @@ impl Rpc for RpcImpl {
     }
 }
 
+fn extract_fee_payer_from_transaction(transaction_base64: &str) -> AnyhowResult<Pubkey> {
+    let transaction_bytes = BASE64
+        .decode(transaction_base64.trim())
+        .context("Failed to decode transaction from base64")?;
+
+    let transaction: Transaction =
+        bincode::deserialize(&transaction_bytes).context("Failed to deserialize transaction")?;
+
+    transaction
+        .message
+        .account_keys
+        .get(0)
+        .copied()
+        .ok_or_else(|| anyhow!("Transaction has no account keys"))
+}
+
 fn spawn_ws_followups(
     config: WebSocketEndpointsConfig,
     tx_sig: String,
     client_timestamp_ms: u64,
     transaction_base64: Option<String>,
+    wallet_address: Option<String>,
 ) {
     tokio::spawn(async move {
         let WebSocketEndpointsConfig {
@@ -245,22 +283,29 @@ fn spawn_ws_followups(
         }
 
         if let Some(url) = helius_ws_url {
-            subscription_count += 1;
-            let signature = tx_sig.clone();
-            let ready = ready_tx.clone();
-            tokio::spawn(async move {
-                if let Err(err) = run_helius_subscription(
-                    url,
-                    signature,
-                    "Helius WS",
-                    client_timestamp_ms,
-                    Some(ready),
-                )
-                .await
-                {
-                    warn!("Helius WS subscription task failed: {}", err);
-                }
-            });
+            if let Some(wallet) = wallet_address {
+                subscription_count += 1;
+                let signature = tx_sig.clone();
+                let ready = ready_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = run_helius_subscription(
+                        url,
+                        signature,
+                        wallet,
+                        "Helius WS",
+                        client_timestamp_ms,
+                        Some(ready),
+                    )
+                    .await
+                    {
+                        warn!("Helius WS subscription task failed: {}", err);
+                    }
+                });
+            } else {
+                warn!(
+                    "Helius WS URL configured but no wallet address available (transaction not provided or invalid)"
+                );
+            }
         }
 
         drop(ready_tx);
@@ -376,6 +421,7 @@ async fn run_signature_subscription(
 async fn run_helius_subscription(
     url: String,
     signature: String,
+    wallet: String,
     source_name: &'static str,
     client_timestamp_ms: u64,
     ready_notifier: Option<Sender<String>>,
@@ -387,6 +433,7 @@ async fn run_helius_subscription(
         "params": [
             {
                 "signature": signature.clone(),
+                "accountInclude": [wallet],
                 "failed": false
             },
             {
