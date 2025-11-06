@@ -235,9 +235,10 @@ fn spawn_ws_followups(
             solana_rpc_url,
         } = config;
 
-        let (ready_tx, mut ready_rx) = mpsc::channel::<String>(4);
+        let (ready_tx, mut ready_rx) = mpsc::channel::<(String, bool)>(4); // (source_name, success)
         let (summary_tx, mut summary_rx) = mpsc::channel::<(&'static str, f64)>(4);
         let mut subscription_count = 0usize;
+        let mut endpoints_attempted = Vec::<&'static str>::new();
 
         if let Some(url) = shred_ws_url {
             // Skip Shred WS subscription if it points to localhost - the deshred module
@@ -256,26 +257,30 @@ fn spawn_ws_followups(
                     sub.summary_sender = Some(summary_tx.clone());
                 }
                 subscription_count += 1; // Count it - deshred will report result
+                endpoints_attempted.push("Shred WS");
 
                 // Send ready signal immediately - deshred is always ready
-                let _ = ready_tx.send("Shred WS".to_string()).await;
+                let _ = ready_tx.send(("Shred WS".to_string(), true)).await;
             } else {
                 subscription_count += 1;
+                endpoints_attempted.push("Shred WS");
                 let signature = tx_sig.clone();
                 let ready = ready_tx.clone();
                 let summary = summary_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = run_signature_subscription(
+                    let success = run_signature_subscription(
                         url,
                         signature,
                         "Shred WS",
                         client_timestamp_ms,
-                        Some(ready),
+                        Some(ready.clone()),
                         Some(summary),
                     )
                     .await
-                    {
-                        warn!("Shred WS subscription task failed: {}", err);
+                    .is_ok();
+
+                    if !success {
+                        let _ = ready.send(("Shred WS".to_string(), false)).await;
                     }
                 });
             }
@@ -283,42 +288,48 @@ fn spawn_ws_followups(
 
         if let Some(url) = local_ws_url {
             subscription_count += 1;
+            endpoints_attempted.push("Local WS");
             let signature = tx_sig.clone();
             let ready = ready_tx.clone();
             let summary = summary_tx.clone();
             tokio::spawn(async move {
-                if let Err(err) = run_signature_subscription(
+                let success = run_signature_subscription(
                     url,
                     signature,
                     "Local WS",
                     client_timestamp_ms,
-                    Some(ready),
+                    Some(ready.clone()),
                     Some(summary),
                 )
                 .await
-                {
-                    warn!("Local WS subscription task failed: {}", err);
+                .is_ok();
+
+                if !success {
+                    let _ = ready.send(("Local WS".to_string(), false)).await;
                 }
             });
         }
 
         if let Some(url) = local_enhanced_ws_url {
             subscription_count += 1;
+            endpoints_attempted.push("Local Enhanced WS");
             let signature = tx_sig.clone();
             let ready = ready_tx.clone();
             let summary = summary_tx.clone();
             tokio::spawn(async move {
-                if let Err(err) = run_signature_subscription(
+                let success = run_signature_subscription(
                     url,
                     signature,
                     "Local Enhanced WS",
                     client_timestamp_ms,
-                    Some(ready),
+                    Some(ready.clone()),
                     Some(summary),
                 )
                 .await
-                {
-                    warn!("Local Enhanced WS subscription task failed: {}", err);
+                .is_ok();
+
+                if !success {
+                    let _ = ready.send(("Local Enhanced WS".to_string(), false)).await;
                 }
             });
         }
@@ -326,22 +337,25 @@ fn spawn_ws_followups(
         if let Some(url) = helius_ws_url {
             if let Some(wallet) = wallet_address {
                 subscription_count += 1;
+                endpoints_attempted.push("Helius WS");
                 let signature = tx_sig.clone();
                 let ready = ready_tx.clone();
                 let summary = summary_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = run_helius_subscription(
+                    let success = run_helius_subscription(
                         url,
                         signature,
                         wallet,
                         "Helius WS",
                         client_timestamp_ms,
-                        Some(ready),
+                        Some(ready.clone()),
                         Some(summary),
                     )
                     .await
-                    {
-                        warn!("Helius WS subscription task failed: {}", err);
+                    .is_ok();
+
+                    if !success {
+                        let _ = ready.send(("Helius WS".to_string(), false)).await;
                     }
                 });
             } else {
@@ -356,6 +370,8 @@ fn spawn_ws_followups(
 
         if subscription_count > 0 {
             let mut ready_count = 0usize;
+            let mut succeeded = Vec::<String>::new();
+            let mut failed = Vec::<String>::new();
             let timeout = tokio::time::sleep(Duration::from_secs(2));
             tokio::pin!(timeout);
 
@@ -363,24 +379,29 @@ fn spawn_ws_followups(
                 tokio::select! {
                     _ = &mut timeout => {
                         warn!(
-                            "Subscription readiness timeout: {}/{} ready before sending transaction",
+                            "Subscription readiness timeout: {}/{} responded before sending transaction",
                             ready_count, subscription_count
                         );
                         break;
                     }
-                    maybe_source = ready_rx.recv() => {
-                        match maybe_source {
-                            Some(source) => {
+                    maybe_status = ready_rx.recv() => {
+                        match maybe_status {
+                            Some((source, success)) => {
                                 ready_count += 1;
-                                info!("✓ {} subscription confirmed", source);
+                                if success {
+                                    info!("✓ {} subscription confirmed", source);
+                                    succeeded.push(source);
+                                } else {
+                                    warn!("✗ {} subscription failed", source);
+                                    failed.push(source);
+                                }
                                 if ready_count >= subscription_count {
-                                    info!("All {} subscriptions confirmed", subscription_count);
                                     break;
                                 }
                             }
                             None => {
                                 warn!(
-                                    "Subscription readiness channel closed early: {}/{} ready",
+                                    "Subscription readiness channel closed early: {}/{} responded",
                                     ready_count, subscription_count
                                 );
                                 break;
@@ -390,10 +411,31 @@ fn spawn_ws_followups(
                 }
             }
 
-            if ready_count < subscription_count {
+            // Show summary
+            info!("");
+            info!("========== WebSocket Subscription Summary ==========");
+            info!("Total endpoints: {}", endpoints_attempted.len());
+            info!("Succeeded: {} {:?}", succeeded.len(), succeeded);
+            info!("Failed: {} {:?}", failed.len(), failed);
+
+            // Check for missing (timed out)
+            let missing: Vec<_> = endpoints_attempted
+                .iter()
+                .filter(|&&e| !succeeded.iter().any(|s| s == e) && !failed.iter().any(|f| f == e))
+                .collect();
+            if !missing.is_empty() {
+                info!("Timed out: {} {:?}", missing.len(), missing);
+            }
+            info!("====================================================");
+            info!("");
+
+            if succeeded.is_empty() {
+                warn!("⚠ No subscriptions succeeded! Transaction will be sent anyway.");
+            } else if !failed.is_empty() || !missing.is_empty() {
                 warn!(
-                    "Proceeding with transaction send after partial readiness: {}/{} ready",
-                    ready_count, subscription_count
+                    "⚠ Proceeding with transaction send after partial success ({}/{} ready)",
+                    succeeded.len(),
+                    subscription_count
                 );
             }
         }
@@ -486,7 +528,7 @@ async fn run_signature_subscription(
     signature: String,
     source_name: &'static str,
     client_timestamp_ms: u64,
-    ready_notifier: Option<Sender<String>>,
+    ready_notifier: Option<Sender<(String, bool)>>,
     summary_sender: Option<Sender<(&'static str, f64)>>,
 ) -> AnyhowResult<()> {
     let request = json!({
@@ -515,7 +557,7 @@ async fn run_helius_subscription(
     wallet: String,
     source_name: &'static str,
     client_timestamp_ms: u64,
-    ready_notifier: Option<Sender<String>>,
+    ready_notifier: Option<Sender<(String, bool)>>,
     summary_sender: Option<Sender<(&'static str, f64)>>,
 ) -> AnyhowResult<()> {
     let request = json!({
@@ -555,7 +597,7 @@ async fn run_ws_task(
     request: Value,
     source_name: &'static str,
     expected_method: &'static str,
-    ready_notifier: Option<Sender<String>>,
+    ready_notifier: Option<Sender<(String, bool)>>,
     summary_sender: Option<Sender<(&'static str, f64)>>,
     signature_filter: Option<String>,
     client_timestamp_ms: u64,
@@ -596,7 +638,11 @@ async fn run_ws_task(
 
                 if !subscription_confirmed && value.get("result").is_some() {
                     if let Some(notifier) = ready_notifier.take() {
-                        if notifier.send(source_name.to_string()).await.is_err() {
+                        if notifier
+                            .send((source_name.to_string(), true))
+                            .await
+                            .is_err()
+                        {
                             warn!(
                                 "{} subscription ready signal dropped before being received",
                                 source_name
